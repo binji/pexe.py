@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import json
+import optparse
 import sys
 
-import pexe
+import bitcode
 
 BLOCKID_BLOCKINFO = 0
 BLOCKID_MODULE = 8
@@ -167,7 +167,6 @@ class Context(object):
 
   def ResetValues(self):
     assert self.values_mark is not None
-    #print 'Reset values to %d' % self.values_mark
     del self.values[self.values_mark:]
     self.values_mark = None
 
@@ -178,7 +177,6 @@ class Context(object):
   def AppendValue(self, value):
     self.values.append(value)
     new_idx = len(self.values) - 1
-    #print 'Value %d => %s' % (new_idx, value)
     self.FixupValues(new_idx, value)
 
   def FixupValues(self, idx, value):
@@ -421,7 +419,7 @@ class CastInstruction(Instruction):
     self.opcode = record.values[2]
 
   def Repr(self):
-    return 'Cast %s %s = %s>' % (
+    return 'Cast %s %s = %s' % (
         cast_name[self.opcode], self.opval, self.desttype)
 
 class VSelectInstruction(Instruction):
@@ -655,9 +653,9 @@ class ModuleBlock(object):
     self.cur_function_idx = None
 
     for chunk in block.chunks:
-      if isinstance(chunk, pexe.Block):
+      if isinstance(chunk, bitcode.Block):
         self.ParseBlock(chunk, context)
-      elif isinstance(chunk, pexe.Record):
+      elif isinstance(chunk, bitcode.Record):
         self.ParseRecord(chunk, context)
       else:
         raise Error('Bad chunk type')
@@ -706,7 +704,7 @@ class ModuleBlock(object):
 class TypeBlock(object):
   def __init__(self, block, context):
     for chunk in block.chunks:
-      if not isinstance(chunk, pexe.Record):
+      if not isinstance(chunk, bitcode.Record):
         raise Error('Unexpected chunk type')
       self.ParseRecord(chunk, context)
 
@@ -729,7 +727,7 @@ class TypeBlock(object):
 
 class GlobalVarBlock(object):
   def __init__(self, block, context):
-    record_gen = (x for x in block.chunks if isinstance(x, pexe.Record))
+    record_gen = (x for x in block.chunks if isinstance(x, bitcode.Record))
     for record in record_gen:
       self.ParseRecord(record, record_gen, context)
 
@@ -763,7 +761,7 @@ class GlobalVarBlock(object):
 class ValueSymtabBlock(object):
   def __init__(self, block, context):
     for chunk in block.chunks:
-      if not isinstance(chunk, pexe.Record):
+      if not isinstance(chunk, bitcode.Record):
         raise Error('Unexpected chunk type')
       self.ParseRecord(chunk, context)
 
@@ -790,9 +788,9 @@ class FunctionBlock(object):
 
     try:
       for chunk in block.chunks:
-        if isinstance(chunk, pexe.Block):
+        if isinstance(chunk, bitcode.Block):
           self.ParseBlock(chunk, context)
-        elif isinstance(chunk, pexe.Record):
+        elif isinstance(chunk, bitcode.Record):
           self.ParseRecord(chunk, context)
         else:
           raise Error('Bad chunk type')
@@ -867,8 +865,6 @@ class FunctionBlock(object):
       self.cur_bb_idx += 1
 
     if inst and inst.HasValue():
-
-      #print 'Appending value for instruction %s' % inst.__class__.__name__
       inst.value_idx = len(context.values)
       context.AppendValue(InstructionValue(inst))
 
@@ -877,7 +873,7 @@ class ConstantsBlock(object):
   def __init__(self, block, context):
     self.curtype = None
     for chunk in block.chunks:
-      if not isinstance(chunk, pexe.Record):
+      if not isinstance(chunk, bitcode.Record):
         raise Error('Unexpected chunk type')
       self.ParseRecord(chunk, context)
 
@@ -901,16 +897,18 @@ def ParseBitCode(bitcode):
 
 
 def main(args):
-  data = open(args[0]).read()
-  bs = pexe.BitStream(map(ord, data))
-  bc = pexe.BitCode()
-  bc.Read(bs)
-  bc = ParseBitCode(bc)
-  #print json.dumps(bc, cls=pexe.Encoder, indent=2, sort_keys=True)
-  for var in bc.global_vars:
+  parser = optparse.OptionParser()
+  options, args = parser.parse_args()
+  if not args:
+    parser.error('Expected file')
+
+  bc = bitcode.Read(open(args[0]))
+  module = ParseBitCode(bc)
+
+  for var in module.global_vars:
     print 'Global %s' % var
   print
-  for function in bc.functions:
+  for function in module.functions:
     if function.value.is_proto:
       continue
     print 'Function %s' % function.value
@@ -919,7 +917,6 @@ def main(args):
       for inst in bb.instructions:
         print '   ', inst
     print
-
 
 
 if __name__ == '__main__':

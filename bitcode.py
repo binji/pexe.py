@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import json
+import optparse
 import sys
 
 ENTRY_END_BLOCK = 0
@@ -386,20 +386,34 @@ class BitCode(object):
       self.blocks.append(block)
 
 
-class Encoder(json.JSONEncoder):
-  def default(self, o):
-    d = o.__dict__
-    if len(o.__class__.__mro__) > 2:
-      d = dict(d)
-      d.update(_type=o.__class__.__name__)
-    return d
+def Read(f):
+  return ReadString(f.read())
+
+
+def ReadString(s):
+  data = [ord(x) for x in s]
+  bs = BitStream(data)
+  bc = BitCode()
+  bc.Read(bs)
+  return bc
 
 
 def main(args):
-  data = open(args[0]).read()
-  bs = BitStream(map(ord, data))
-  bc = BitCode()
-  bc.Read(bs)
+  parser = optparse.OptionParser()
+  options, args = parser.parse_args()
+  if not args:
+    parser.error('Expected file')
+
+  bc = Read(open(args[0]))
+
+  import json
+  class Encoder(json.JSONEncoder):
+    def default(self, o):
+      d = o.__dict__
+      if len(o.__class__.__mro__) > 2:
+        d = dict(d)
+        d.update(_type=o.__class__.__name__)
+      return d
   print json.dumps(bc, cls=Encoder, indent=2, sort_keys=True)
 
 
