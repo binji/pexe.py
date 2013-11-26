@@ -56,8 +56,8 @@ class BitStream(object):
   def ReadFracBits(self, num_bits):
     assert num_bits <= 8 - self.bit_offset
 
-    mask = ((1 << num_bits) - 1) << self.bit_offset
-    result = (self.data[self.byte_offset] & mask) >> self.bit_offset
+    mask = (1 << num_bits) - 1
+    result = (self.data[self.byte_offset] >> self.bit_offset) & mask
     self.bit_offset += num_bits
     if self.bit_offset == 8:
       self.byte_offset += 1
