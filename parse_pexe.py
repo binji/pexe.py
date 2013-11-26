@@ -107,6 +107,35 @@ FUNC_CODE_INST_CALL = 34
 FUNC_CODE_INST_FORWARDTYPEREF = 43
 FUNC_CODE_INST_CALL_INDIRECT = 44
 
+FCMP_FALSE = 0
+FCMP_OEQ = 1
+FCMP_OGT = 2
+FCMP_OGE = 3
+FCMP_OLT = 4
+FCMP_OLE = 5
+FCMP_ONE = 6
+FCMP_ORD = 7
+FCMP_UNO = 8
+FCMP_UEQ = 9
+FCMP_UGT = 10
+FCMP_UGE = 11
+FCMP_ULT = 12
+FCMP_ULE = 13
+FCMP_UNE = 14
+FCMP_TRUE = 15
+ICMP_EQ = 32
+ICMP_NE = 33
+ICMP_UGT = 34
+ICMP_UGE = 35
+ICMP_ULT = 36
+ICMP_ULE = 37
+ICMP_SGT = 38
+ICMP_SGE = 39
+ICMP_SLT = 40
+ICMP_SLE = 41
+cmp_name = dict((v, k.lower()) for k, v in vars().iteritems()
+                if k.startswith(('FCMP', 'ICMP')))
+
 
 def DecodeSignRotatedValue(x):
   if (x & 1) == 0:
@@ -413,7 +442,7 @@ class Cmp2Instruction(Instruction):
     self.predicate = record.values[2]
 
   def Repr(self):
-    return 'Cmp %s %s %s' % (self.predicate, self.opval0, self.opval1)
+    return 'Cmp %s %s %s' % (cmp_name[self.predicate], self.opval0, self.opval1)
 
 class RetInstruction(Instruction):
   def __init__(self, record, context):
