@@ -130,6 +130,7 @@ class Context(object):
     # This will be a reference to a list of all basic blocks for the
     # function currently being parsed
     self.basic_blocks = None
+    self.global_vars = []
 
   def MarkValues(self):
     assert self.values_mark is None
@@ -140,6 +141,10 @@ class Context(object):
     #print 'Reset values to %d' % self.values_mark
     del self.values[self.values_mark:]
     self.values_mark = None
+
+  def FunctionValues(self):
+    assert self.values_mark is not None
+    return self.values[self.values_mark:]
 
   def AppendValue(self, value):
     self.values.append(value)
@@ -180,29 +185,31 @@ class Value(object):
   pass
 
 class FunctionValue(Value):
-  def __init__(self, record, context):
+  def __init__(self, record, context, index):
+    self.index = index
     self.type = context.types[record.values[0]]
     self.calling_conv = record.values[1]
     self.is_proto = record.values[2]
     self.linkage = record.values[3]
 
-  def __str__(self):
-    name = getattr(self, 'name', '')
-    return '<Function %s %s>' % (name, self.type)
+  def __repr__(self):
+    if hasattr(self, 'name'):
+      return '<%%%s: Function %s %s>' % (self.index, self.name, self.type)
+    return '<%%%s: Function %s>' % (self.index, self.type)
 
 class FunctionArgValue(Value):
   def __init__(self, idx, curtype):
     self.type = curtype
     self.arg_index = idx
 
-  def __str__(self):
+  def __repr__(self):
     return '<Function Arg %d %s>' % (self.arg_index, self.type)
 
 class UndefConstantValue(Value):
   def __init__(self, curtype):
     self.type = curtype
 
-  def __str__(self):
+  def __repr__(self):
     return '<Undef Constant %s>' % self.type
 
 class IntegerConstantValue(Value):
@@ -212,7 +219,7 @@ class IntegerConstantValue(Value):
     self.type = curtype
     self.value = DecodeSignRotatedValue(record.values[0])
 
-  def __str__(self):
+  def __repr__(self):
     return '<Integer Constant %d>' % self.value
 
 class FloatConstantValue(Value):
@@ -222,37 +229,44 @@ class FloatConstantValue(Value):
     self.type = curtype
     self.value = record.values[0]
 
-  def __str__(self):
+  def __repr__(self):
     return '<Float Constant %f>' % self.value
 
 class InstructionValue(Value):
   def __init__(self, inst):
     self.inst = inst
 
-  def __str__(self):
-    return '<%s Value>' % self.inst.__class__.__name__
+  def __repr__(self):
+    return '<%%%s Value>' % self.inst.value_idx
+
+class GlobalVarValue(Value):
+  def __init__(self, var):
+    self.var = var
+
+  def __repr__(self):
+    return '<%%%s Global Value>' % self.var.index
 
 
 class Type(object):
   pass
 
 class VoidType(Type):
-  def __str__(self):
+  def __repr__(self):
     return 'void'
 
 class FloatType(Type):
-  def __str__(self):
+  def __repr__(self):
     return 'float'
 
 class DoubleType(Type):
-  def __str__(self):
+  def __repr__(self):
     return 'double'
 
 class IntegerType(Type):
   def __init__(self, record):
     self.width = record.values[0]
 
-  def __str__(self):
+  def __repr__(self):
     return 'int%d' % self.width
 
 class FunctionType(Type):
@@ -261,15 +275,16 @@ class FunctionType(Type):
     self.rettype = context.types[record.values[1]]
     self.argtypes = [context.types[x] for x in record.values[2:]]
 
-  def __str__(self):
-    args = [str(argtype) for argtype in self.argtypes]
+  def __repr__(self):
+    args = map(repr, self.argtypes)
     if self.varargs:
       args.append('...')
     return '%s(%s)' % (self.rettype, ', '.join(args))
 
 
 class GlobalVar(object):
-  def __init__(self, record):
+  def __init__(self, record, index):
+    self.index = index
     self.alignment = (1 << record.values[0]) >> 1
     self.is_constant = record.values[1] != 0
     self.initializers = []
@@ -277,28 +292,51 @@ class GlobalVar(object):
   def AppendInitializer(self, initializer):
     self.initializers.append(initializer)
 
-class ZeroFillInitializer(object):
+  def __repr__(self):
+    const_str = ' const' if self.is_constant else ''
+    return '<%%%s: GlobalVar %s align=%d%s>' % (
+        self.index, ', '.join(map(repr, self.initializers)),
+        self.alignment, const_str)
+
+
+class Initializer(object):
+  pass
+
+class ZeroFillInitializer(Initializer):
   def __init__(self, record):
     self.num_bytes = record.values[0]
 
-class DataInitializer(object):
+  def __repr__(self):
+    return '<Zero %d>' % self.num_bytes
+
+class DataInitializer(Initializer):
   def __init__(self, record):
     self.data = record.values[:]
 
-class RelocInitializer(object):
+  def __repr__(self):
+    return '<Data %d bytes>' % len(self.data)
+
+class RelocInitializer(Initializer):
   def __init__(self, record, context):
     def fixup(value):
       self.base_val = value
 
     idx = record.values[0]
     self.base_val = context.GetOrCreateValue(idx, fixup)
+    self.addend = 0
     if len(record.values) == 2:
       self.addend = record.values[1]
+
+  def __repr__(self):
+    if self.addend:
+      return '<Reloc %s + %d>' % (self.base_val, self.addend)
+    return '<Reloc %s>' % self.base_val
 
 
 class Function(object):
   def __init__(self, value):
     self.value = value
+    self.values = None
     self.basic_blocks = []
 
 
@@ -308,14 +346,26 @@ class BasicBlock(object):
 
 
 class Instruction(object):
+  def __init__(self):
+    self.value_idx = None
+
   def IsTerminator(self):
     return False
 
   def HasValue(self):
     return True
 
+  def __repr__(self):
+    if self.value_idx is not None:
+      return '<%%%s: %s>' % (self.value_idx, self.Repr())
+    return '<%s>' % self.Repr()
+
+  def Repr(self):
+    return 'None'
+
 class BinOpInstruction(Instruction):
   def __init__(self, record, context):
+    Instruction.__init__(self)
     self.opval0 = context.GetValueRelative(record.values[0])
     self.opval1 = context.GetValueRelative(record.values[1])
     self.opcode = record.values[2]
@@ -330,40 +380,44 @@ class BinOpInstruction(Instruction):
         # TODO(binji): handle fast-math flags.
         pass
 
-  def __str__(self):
-    return '<BinOp %s %s %s>' % (
+  def Repr(self):
+    return 'BinOp %s %s %s' % (
         binop_name[self.opcode], self.opval0, self.opval1)
 
 class CastInstruction(Instruction):
   def __init__(self, record, context):
+    Instruction.__init__(self)
     self.opval = context.GetValueRelative(record.values[0])
     self.desttype = context.types[record.values[1]]
     self.opcode = record.values[2]
 
-  def __str__(self):
-    return '<Cast %s %s => %s>' % (
+  def Repr(self):
+    return 'Cast %s %s = %s>' % (
         cast_name[self.opcode], self.opval, self.desttype)
 
 class VSelectInstruction(Instruction):
   def __init__(self, record, context):
+    Instruction.__init__(self)
     self.trueval = context.GetValueRelative(record.values[0])
     self.falseval = context.GetValueRelative(record.values[1])
     self.cond = context.GetValueRelative(record.values[2])
 
-  def __str__(self):
-    return '<VSelect %s ? %s : %s>' % (self.cond, self.trueval, self.falseval)
+  def Repr(self):
+    return 'VSelect %s ? %s : %s' % (self.cond, self.trueval, self.falseval)
 
 class Cmp2Instruction(Instruction):
   def __init__(self, record, context):
+    Instruction.__init__(self)
     self.opval0 = context.GetValueRelative(record.values[0])
     self.opval1 = context.GetValueRelative(record.values[1])
     self.predicate = record.values[2]
 
-  def __str__(self):
-    return '<Cmp %s %s %s>' % (self.predicate, self.opval0, self.opval1)
+  def Repr(self):
+    return 'Cmp %s %s %s' % (self.predicate, self.opval0, self.opval1)
 
 class RetInstruction(Instruction):
   def __init__(self, record, context):
+    Instruction.__init__(self)
     self.opval = None
     if len(record.values) == 1:
       self.opval = context.GetValueRelative(record.values[0])
@@ -371,13 +425,14 @@ class RetInstruction(Instruction):
   def IsTerminator(self):
     return True
 
-  def __str__(self):
+  def Repr(self):
     if self.opval:
-      return '<Ret %s>' % self.opval
-    return '<Ret>'
+      return 'Ret %s' % self.opval
+    return 'Ret'
 
 class BrInstruction(Instruction):
   def __init__(self, record, context):
+    Instruction.__init__(self)
     self.true_bb = record.values[0]
     self.cond = None
     self.false_bb = None
@@ -391,13 +446,14 @@ class BrInstruction(Instruction):
   def HasValue(self):
     return False
 
-  def __str__(self):
+  def Repr(self):
     if self.false_bb:
-      return '<Br %s ? %s : %s>' % (self.cond, self.true_bb, self.false_bb)
-    return '<Br %s>' % self.true_bb
+      return 'Br %s ? %s : %s' % (self.cond, self.true_bb, self.false_bb)
+    return 'Br %s' % self.true_bb
 
 class SwitchInstruction(Instruction):
   def __init__(self, record, context):
+    Instruction.__init__(self)
     self.type = context.types[record.values[0]]
     self.cond = context.GetValueRelative(record.values[1])
     self.default_bb = record.values[2]
@@ -413,6 +469,10 @@ class SwitchInstruction(Instruction):
   def HasValue(self):
     return False
 
+  def Repr(self):
+    return 'Switch %s %s default: %s %s' % (
+        self.type, self.cond, self.default_bb, ' '.join(map(repr, self.cases)))
+
 class SwitchCase(object):
   def __init__(self, value_gen):
     self.items = []
@@ -421,16 +481,25 @@ class SwitchCase(object):
       self.items.append(SwitchCaseItem(value_gen))
     self.dest_bb = next(value_gen)
 
+  def __repr__(self):
+    return '<%s => %s>' % (', '.join(map(repr, self.items)), self.dest_bb)
+
 class SwitchCaseItem(object):
   def __init__(self, value_gen):
     is_single_number = next(value_gen)
     self.low = DecodeSignRotatedValue(next(value_gen))
+    self.high = None
     if not is_single_number:
       self.high = DecodeSignRotatedValue(next(value_gen))
 
+  def __repr__(self):
+    if self.high:
+      return '<%s..%s>' % (self.low, self.high)
+    return '<%s>' % self.low
+
 class UnreachableInstruction(Instruction):
   def __init__(self, record, context):
-    pass
+    Instruction.__init__(self)
 
   def IsTerminator(self):
     return True
@@ -438,11 +507,12 @@ class UnreachableInstruction(Instruction):
   def HasValue(self):
     return False
 
-  def __str__(self):
-    return '<Unreachable>'
+  def Repr(self):
+    return 'Unreachable'
 
 class PhiInstruction(Instruction):
   def __init__(self, record, context):
+    Instruction.__init__(self)
     self.type = context.types[record.values[0]]
     value_gen = (x for x in record.values[1:])
     self.incoming = []
@@ -450,10 +520,8 @@ class PhiInstruction(Instruction):
     for _ in range(num_incoming):
       self.incoming.append(PhiIncoming(value_gen, context))
 
-  def __str__(self):
-    return '<Phi %s %s>' % (
-        self.type,
-        ' '.join('(%s => %s)' % (x.bb, x.value) for x in self.incoming))
+  def Repr(self):
+    return 'Phi %s %s' % (self.type, ' '.join(map(repr, self.incoming)))
 
 class PhiIncoming(object):
   def __init__(self, value_gen, context):
@@ -467,25 +535,31 @@ class PhiIncoming(object):
       self.value = context.GetOrCreateValue(idx, fixup)
     self.bb = next(value_gen)
 
+  def __repr__(self):
+    return '<%s => %s>' % (self.bb, self.value)
+
 class AllocaInstruction(Instruction):
   def __init__(self, record, context):
+    Instruction.__init__(self)
     self.size = context.GetValueRelative(record.values[0])
     self.alignment = (1 << record.values[1]) >> 1
 
-  def __str__(self):
-    return '<Alloca %s align=%d>' % (self.size, self.alignment)
+  def Repr(self):
+    return 'Alloca %s align=%d' % (self.size, self.alignment)
 
 class LoadInstruction(Instruction):
   def __init__(self, record, context):
+    Instruction.__init__(self)
     self.source = context.GetValueRelative(record.values[0])
     self.alignment = (1 << record.values[1]) >> 1
     self.type = context.types[record.values[2]]
 
-  def __str__(self):
-    return '<Load %s <= %s align=%d>' % (self.type, self.source, self.alignment)
+  def Repr(self):
+    return 'Load %s <= %s align=%d' % (self.type, self.source, self.alignment)
 
 class StoreInstruction(Instruction):
   def __init__(self, record, context):
+    Instruction.__init__(self)
     self.dest = context.GetValueRelative(record.values[0])
     self.value = context.GetValueRelative(record.values[1])
     self.alignment = (1 << record.values[2]) >> 1
@@ -493,11 +567,12 @@ class StoreInstruction(Instruction):
   def HasValue(self):
     return False
 
-  def __str__(self):
-    return '<Store %s >= %s align=%d>' % (self.value, self.dest, self.alignment)
+  def Repr(self):
+    return 'Store %s >= %s align=%d' % (self.value, self.dest, self.alignment)
 
 class CallInstruction(Instruction):
   def __init__(self, record, context, is_indirect):
+    Instruction.__init__(self)
     self.is_indirect = is_indirect
     cc_info = record.values[0]
     self.is_tail_call = (cc_info & 1) != 0
@@ -523,12 +598,20 @@ class CallInstruction(Instruction):
   def HasValue(self):
     return not isinstance(self.rettype, VoidType)
 
-  def __str__(self):
-    arg_str = ', '.join(map(str, self.args))
-    if self.is_indirect:
-      return '<CallIndirect %s (%s)>' % (self.callee, arg_str)
+  def Repr(self):
+    if self.args:
+      arg_str = ' (%s)' % ', '.join(map(repr, self.args))
     else:
-      return '<Call %s (%s)>' % (self.callee.type, arg_str)
+      arg_str = ''
+
+    if self.is_indirect:
+      return 'CallIndirect %s%s' % (self.callee, arg_str)
+    else:
+      if hasattr(self.callee, 'name'):
+        # If we have a name its probably an intrinsic. The type doesn't
+        # really help any.
+        return 'Call %s%s' % (self.callee.name, arg_str)
+      return 'Call %%%s%s' % (self.callee.index, arg_str)
 
 
 
@@ -539,6 +622,7 @@ class ModuleBlock(object):
   def __init__(self, block, context):
     self.version = None
     self.functions = []
+    self.global_vars = []
     self.cur_function_idx = None
 
     for chunk in block.chunks:
@@ -557,6 +641,7 @@ class ModuleBlock(object):
       TypeBlock(block, context)
     elif bid == BLOCKID_GLOBALVAR:
       GlobalVarBlock(block, context)
+      self.global_vars = context.global_vars[:]
     elif bid == BLOCKID_VALUE_SYMTAB:
       ValueSymtabBlock(block, context)
     elif bid == BLOCKID_FUNCTION:
@@ -572,7 +657,8 @@ class ModuleBlock(object):
       self.version = record.values[0]
       context.use_relative_ids = self.version == 1
     elif record.code == MODULE_CODE_FUNCTION:
-      value = FunctionValue(record, context)
+      index = len(context.values)
+      value = FunctionValue(record, context, index)
       context.AppendValue(value)
       self.functions.append(Function(value))
     else:
@@ -614,7 +700,6 @@ class TypeBlock(object):
 
 class GlobalVarBlock(object):
   def __init__(self, block, context):
-    self.vars = []
     record_gen = (x for x in block.chunks if isinstance(x, pexe.Record))
     for record in record_gen:
       self.ParseRecord(record, record_gen, context)
@@ -622,7 +707,8 @@ class GlobalVarBlock(object):
   def ParseRecord(self, record, record_gen, context):
     if record.code == GLOBALVAR_VAR:
       num_initializers = 1
-      var = GlobalVar(record)
+      index = len(context.values)
+      var = GlobalVar(record, index)
       while num_initializers:
         record = next(record_gen)
         if record.code == GLOBALVAR_COMPOUND:
@@ -637,8 +723,8 @@ class GlobalVarBlock(object):
         else:
           raise Error('Bad record code')
         num_initializers -= 1
-      self.vars.append(var)
-      context.AppendValue(var)
+      context.global_vars.append(var)
+      context.AppendValue(GlobalVarValue(var))
     elif record.code == GLOBALVAR_COUNT:
       return
     else:
@@ -683,6 +769,9 @@ class FunctionBlock(object):
           raise Error('Bad chunk type')
     finally:
       context.basic_blocks = None
+
+    # Copy all values from context
+    self.function.values = context.FunctionValues()
 
   def AppendFunctionArgValues(self, context):
     func_type = self.function.value.type
@@ -749,7 +838,9 @@ class FunctionBlock(object):
       self.cur_bb_idx += 1
 
     if inst and inst.HasValue():
+
       #print 'Appending value for instruction %s' % inst.__class__.__name__
+      inst.value_idx = len(context.values)
       context.AppendValue(InstructionValue(inst))
 
 
@@ -787,14 +878,18 @@ def main(args):
   bc.Read(bs)
   bc = ParseBitCode(bc)
   #print json.dumps(bc, cls=pexe.Encoder, indent=2, sort_keys=True)
+  for var in bc.global_vars:
+    print 'Global %s' % var
+  print
   for function in bc.functions:
     if function.value.is_proto:
       continue
-    print 'Function %s' % function.value.type
+    print 'Function %s' % function.value
     for bbno, bb in enumerate(function.basic_blocks):
       print '  Block %d' % bbno
       for inst in bb.instructions:
         print '   ', inst
+    print
 
 
 

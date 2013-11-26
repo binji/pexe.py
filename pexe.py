@@ -33,16 +33,6 @@ BLOCKINFO_CODE_SETRECORDNAME = 3
 CHAR6 = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._'
 
 
-def UpdateDict(d, **kwargs):
-  result = dict(d)
-  for k, v in kwargs.iteritems():
-    if v is not None:
-      result[k] = v
-    else:
-      del result[k]
-  return result
-
-
 class Error(Exception):
   pass
 
