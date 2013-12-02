@@ -203,17 +203,14 @@ class Value(object):
   pass
 
 class FunctionValue(Value):
-  def __init__(self, record, context, index):
-    self.index = index
-    self.type = context.types[record.values[0]]
-    self.calling_conv = record.values[1]
-    self.is_proto = record.values[2]
-    self.linkage = record.values[3]
+  def __init__(self, function):
+    self.function = function
+
+  def SetName(self, name):
+    self.function.name = name
 
   def __repr__(self):
-    if hasattr(self, 'name'):
-      return '<%%%s: Function %s %s>' % (self.index, self.name, self.type)
-    return '<%%%s: Function %s>' % (self.index, self.type)
+    return '<%%%s Function Value>' % self.function.index
 
 class FunctionArgValue(Value):
   def __init__(self, idx, curtype):
@@ -316,6 +313,9 @@ class GlobalVar(object):
         self.index, ', '.join(map(repr, self.initializers)),
         self.alignment, const_str)
 
+  def GetSize(self):
+    return sum(x.GetSize() for x in self.initializers)
+
 
 class Initializer(object):
   pass
@@ -324,12 +324,18 @@ class ZeroFillInitializer(Initializer):
   def __init__(self, record):
     self.num_bytes = record.values[0]
 
+  def GetSize(self):
+    return self.num_bytes
+
   def __repr__(self):
     return '<Zero %d>' % self.num_bytes
 
 class DataInitializer(Initializer):
   def __init__(self, record):
     self.data = record.values[:]
+
+  def GetSize(self):
+    return len(self.data)
 
   def __repr__(self):
     return '<Data %d bytes>' % len(self.data)
@@ -345,6 +351,9 @@ class RelocInitializer(Initializer):
     if len(record.values) == 2:
       self.addend = record.values[1]
 
+  def GetSize(self):
+    return 4
+
   def __repr__(self):
     if self.addend:
       return '<Reloc %s + %d>' % (self.base_val, self.addend)
@@ -352,10 +361,20 @@ class RelocInitializer(Initializer):
 
 
 class Function(object):
-  def __init__(self, value):
-    self.value = value
+  def __init__(self, record, context, index):
+    self.index = index
+    self.type = context.types[record.values[0]]
+    self.calling_conv = record.values[1]
+    self.is_proto = record.values[2]
+    self.linkage = record.values[3]
     self.values = None
     self.basic_blocks = []
+    self.name = ''
+
+  def __repr__(self):
+    if self.name:
+      return '<%%%s: Function %s %s>' % (self.index, self.name, self.type)
+    return '<%%%s: Function %s>' % (self.index, self.type)
 
 
 class BasicBlock(object):
@@ -603,7 +622,7 @@ class CallInstruction(Instruction):
     if is_indirect:
       self.rettype = context.types[next(value_gen)]
     else:
-      self.type = self.callee.type
+      self.type = self.callee.function.type
       self.rettype = self.type.rettype
 
       if not isinstance(self.type, FunctionType):
@@ -625,11 +644,11 @@ class CallInstruction(Instruction):
     if self.is_indirect:
       return 'CallIndirect %s%s' % (self.callee, arg_str)
     else:
-      if hasattr(self.callee, 'name'):
+      if self.callee.function.name:
         # If we have a name its probably an intrinsic. The type doesn't
         # really help any.
-        return 'Call %s%s' % (self.callee.name, arg_str)
-      return 'Call %%%s%s' % (self.callee.index, arg_str)
+        return 'Call %s%s' % (self.callee.function.name, arg_str)
+      return 'Call %%%s%s' % (self.callee.function.index, arg_str)
 
 
 
@@ -676,9 +695,9 @@ class ModuleBlock(object):
       context.use_relative_ids = self.version == 1
     elif record.code == MODULE_CODE_FUNCTION:
       index = len(context.values)
-      value = FunctionValue(record, context, index)
-      context.AppendValue(value)
-      self.functions.append(Function(value))
+      function = Function(record, context, index)
+      context.AppendValue(FunctionValue(function))
+      self.functions.append(function)
     else:
       raise Error('Bad record code')
 
@@ -687,7 +706,7 @@ class ModuleBlock(object):
       self.cur_function_idx = 0
     else:
       self.cur_function_idx += 1
-    while self.functions[self.cur_function_idx].value.is_proto:
+    while self.functions[self.cur_function_idx].is_proto:
       self.cur_function_idx += 1
     return self.functions[self.cur_function_idx]
 
@@ -759,12 +778,12 @@ class ValueSymtabBlock(object):
   def ParseRecord(self, record, context):
     if record.code == VST_CODE_ENTRY:
       value_id = record.values[0]
-      name = record.values[1:]
-      context.values[value_id].name = ''.join(name)
+      name = ''.join(record.values[1:])
+      context.values[value_id].SetName(name)
     elif record.code == VST_CODE_BBENTRY:
       bb_id = record.values[0]
       name = record.values[1:]
-      context.basic_blocks[bb_id].name = ''.join(name)
+      context.basic_blocks[bb_id].name = name
     else:
       raise Error('Bad record code')
 
@@ -792,7 +811,7 @@ class FunctionBlock(object):
     self.function.values = context.FunctionValues()
 
   def AppendFunctionArgValues(self, context):
-    func_type = self.function.value.type
+    func_type = self.function.type
     if not isinstance(func_type, FunctionType):
       raise Error('Expected function type')
     for i, argtype in enumerate(func_type.argtypes):
@@ -881,6 +900,14 @@ class ConstantsBlock(object):
       raise Error('Bad record code')
 
 
+def Read(f):
+  return ReadString(f.read())
+
+
+def ReadString(s):
+  return ParseBitCode(bitcode.ReadString(s))
+
+
 def ParseBitCode(bitcode):
   context = Context()
   module_block = bitcode.blocks[0]
@@ -900,9 +927,9 @@ def main(args):
     print 'Global %s' % var
   print
   for function in module.functions:
-    if function.value.is_proto:
+    if function.is_proto:
       continue
-    print 'Function %s' % function.value
+    print 'Function %s' % function
     for bbno, bb in enumerate(function.basic_blocks):
       print '  Block %d' % bbno
       for inst in bb.instructions:
