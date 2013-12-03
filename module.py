@@ -151,6 +151,7 @@ class Context(object):
     # function currently being parsed
     self.basic_blocks = None
     self.global_vars = []
+    self.cur_bb_idx = None
 
   def MarkValues(self):
     assert self.values_mark is None
@@ -792,7 +793,7 @@ class FunctionBlock(object):
   def __init__(self, block, context, function):
     self.function = function
     context.basic_blocks = self.function.basic_blocks
-    self.cur_bb_idx = 0
+    context.cur_bb_idx = 0
 
     self.AppendFunctionArgValues(context)
 
@@ -833,7 +834,7 @@ class FunctionBlock(object):
       num_bbs = record.values[0]
       for _ in range(num_bbs):
         self.function.basic_blocks.append(BasicBlock())
-      self.cur_bb_idx = 0
+      context.cur_bb_idx = 0
       return
     elif record.code == FUNC_CODE_INST_BINOP:
       inst = BinOpInstruction(record, context)
@@ -868,11 +869,11 @@ class FunctionBlock(object):
     else:
       raise Error('Bad record code')
 
-    cur_bb = self.function.basic_blocks[self.cur_bb_idx]
+    cur_bb = self.function.basic_blocks[context.cur_bb_idx]
     cur_bb.instructions.append(inst)
 
     if inst and inst.IsTerminator():
-      self.cur_bb_idx += 1
+      context.cur_bb_idx += 1
 
     if inst and inst.HasValue():
       inst.value_idx = len(context.values)
