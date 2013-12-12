@@ -200,12 +200,15 @@ class Context(object):
     return self.GetOrCreateValue(self.GetRelativeIndex(idx), fixup_fn)
 
 
+## Values ##
+
 class Value(object):
   pass
 
 class FunctionValue(Value):
   def __init__(self, function):
     self.function = function
+    self.type = self.function.type
 
   def SetName(self, name):
     self.function.name = name
@@ -216,10 +219,10 @@ class FunctionValue(Value):
 class FunctionArgValue(Value):
   def __init__(self, idx, curtype):
     self.type = curtype
-    self.arg_index = idx
+    self.value_idx = idx
 
   def __repr__(self):
-    return '<Function Arg %d %s>' % (self.arg_index, self.type)
+    return '<Function Arg %%%d %s>' % (self.value_idx, self.type)
 
 class UndefConstantValue(Value):
   def __init__(self, curtype):
@@ -236,7 +239,7 @@ class IntegerConstantValue(Value):
     self.value = DecodeSignRotatedValue(record.values[0])
 
   def __repr__(self):
-    return '<Integer Constant %d>' % self.value
+    return '<Integer Constant %d %s>' % (self.value, self.type)
 
 class FloatConstantValue(Value):
   def __init__(self, record, curtype):
@@ -246,25 +249,37 @@ class FloatConstantValue(Value):
     self.value = record.values[0]
 
   def __repr__(self):
-    return '<Float Constant %f>' % self.value
+    return '<Float Constant %f %s>' % (self.value, self.type)
 
 class InstructionValue(Value):
   def __init__(self, inst):
     self.inst = inst
+    self.type = None
+    if self.inst.HasValue():
+      self.type = self.inst.type
 
   def __repr__(self):
+    if self.type:
+      return '<%%%s Value %s>' % (self.inst.value_idx, self.type)
     return '<%%%s Value>' % self.inst.value_idx
 
 class GlobalVarValue(Value):
   def __init__(self, var):
     self.var = var
+    self.type = IntegerType(32)
 
   def __repr__(self):
     return '<%%%s Global Value>' % self.var.index
 
 
+## Types ##
+
 class Type(object):
-  pass
+  def __eq__(self, rhs):
+    return type(self) == type(rhs)
+
+  def __ne__(self, rhs):
+    return not (self == rhs)
 
 class VoidType(Type):
   def __repr__(self):
@@ -278,18 +293,36 @@ class DoubleType(Type):
   def __repr__(self):
     return 'double'
 
+  def __eq__(self, rhs):
+    return type(self) == type(rhs)
+
 class IntegerType(Type):
-  def __init__(self, record):
-    self.width = record.values[0]
+  def __init__(self, width):
+    assert width in (1, 8, 16, 32, 64)
+    self.width = width
+
+  @staticmethod
+  def FromRecord(record):
+    return IntegerType(record.values[0])
 
   def __repr__(self):
     return 'int%d' % self.width
 
+  def __eq__(self, rhs):
+    return type(self) == type(rhs) and self.width == rhs.width
+
 class FunctionType(Type):
-  def __init__(self, record, context):
-    self.varargs = record.values[0] != 0
-    self.rettype = context.types[record.values[1]]
-    self.argtypes = [context.types[x] for x in record.values[2:]]
+  def __init__(self, varargs, rettype, *args):
+    self.varargs = varargs
+    self.rettype = rettype
+    self.argtypes = list(args)
+
+  @staticmethod
+  def FromRecord(record, context):
+    varargs = record.values[0] != 0
+    rettype = context.types[record.values[1]]
+    argtypes = [context.types[x] for x in record.values[2:]]
+    return FunctionType(varargs, rettype, *argtypes)
 
   def __repr__(self):
     args = map(repr, self.argtypes)
@@ -297,6 +330,14 @@ class FunctionType(Type):
       args.append('...')
     return '%s(%s)' % (self.rettype, ', '.join(args))
 
+  def __eq__(self, rhs):
+    return (type(self) == type(rhs) and
+            self.varargs == rhs.varargs and
+            self.rettype == rhs.rettype and
+            self.argtypes == rhs.argtypes)
+
+
+## GlobalVar ##
 
 class GlobalVar(object):
   def __init__(self, record, index):
@@ -361,6 +402,8 @@ class RelocInitializer(Initializer):
     return '<Reloc %s>' % self.base_val
 
 
+## Functions and Instructions ##
+
 class Function(object):
   def __init__(self, record, context, index):
     self.index = index
@@ -369,6 +412,7 @@ class Function(object):
     self.is_proto = record.values[2]
     self.linkage = record.values[3]
     self.values = None
+    self.value_idx_offset = None
     self.basic_blocks = []
     self.name = ''
 
@@ -418,6 +462,11 @@ class BinOpInstruction(Instruction):
         # TODO(binji): handle fast-math flags.
         pass
 
+    if self.opval0.type != self.opval1.type:
+      raise Error('BinOp with different types: %s %s' % (
+          self.opval0.type, self.opval1.type))
+    self.type = self.opval0.type
+
   def Repr(self):
     return 'BinOp %s %s %s' % (
         binop_name[self.opcode], self.opval0, self.opval1)
@@ -426,12 +475,11 @@ class CastInstruction(Instruction):
   def __init__(self, record, context):
     Instruction.__init__(self)
     self.opval = context.GetValueRelative(record.values[0])
-    self.desttype = context.types[record.values[1]]
+    self.type = context.types[record.values[1]]
     self.opcode = record.values[2]
 
   def Repr(self):
-    return 'Cast %s %s = %s' % (
-        cast_name[self.opcode], self.opval, self.desttype)
+    return 'Cast %s %s = %s' % (cast_name[self.opcode], self.opval, self.type)
 
 class VSelectInstruction(Instruction):
   def __init__(self, record, context):
@@ -439,6 +487,10 @@ class VSelectInstruction(Instruction):
     self.trueval = context.GetValueRelative(record.values[0])
     self.falseval = context.GetValueRelative(record.values[1])
     self.cond = context.GetValueRelative(record.values[2])
+    if self.trueval.type != self.trueval.type:
+      raise Error('VSelect with different types: %s %s' % (
+          self.trueval.type, self.trueval.type))
+    self.type = self.trueval.type
 
   def Repr(self):
     return 'VSelect %s ? %s : %s' % (self.cond, self.trueval, self.falseval)
@@ -449,6 +501,17 @@ class Cmp2Instruction(Instruction):
     self.opval0 = context.GetValueRelative(record.values[0])
     self.opval1 = context.GetValueRelative(record.values[1])
     self.predicate = record.values[2]
+    if self.opval0.type == self.opval1.type:
+      self.type = self.opval0.type
+    elif ((isinstance(self.opval0.type, FunctionType) and
+           self.opval1.type == IntegerType(32)) or
+         ((self.opval0.type == IntegerType(32)) and
+           isinstance(self.opval1.type, FunctionType))):
+      self.type = IntegerType(32)
+    else:
+      raise Error('Cmp2 with incompatible types: %s %s' % (
+          self.opval0.type, self.opval1.type))
+    self.type = self.opval0.type
 
   def Repr(self):
     return 'Cmp %s %s %s' % (cmp_name[self.predicate], self.opval0, self.opval1)
@@ -462,6 +525,9 @@ class RetInstruction(Instruction):
 
   def IsTerminator(self):
     return True
+
+  def HasValue(self):
+    return False
 
   def Repr(self):
     if self.opval:
@@ -530,6 +596,11 @@ class SwitchCaseItem(object):
     if not is_single_number:
       self.high = DecodeSignRotatedValue(next(value_gen))
 
+  def IsValueInRange(self, value):
+    if self.high is not None:
+      return self.low <= value <= self.high
+    return value == self.low
+
   def __repr__(self):
     if self.high:
       return '<%s..%s>' % (self.low, self.high)
@@ -565,12 +636,15 @@ class PhiIncoming(object):
   def __init__(self, value_gen, context):
     def fixup(value):
       self.value = value
+      self.type = self.value.type
 
     if context.use_relative_ids:
       idx = DecodeSignRotatedValue(next(value_gen))
       self.value = context.GetOrCreateValueRelative(idx, fixup)
     else:
       self.value = context.GetOrCreateValue(idx, fixup)
+    if self.value:
+      self.type = self.value.type
     self.bb = next(value_gen)
 
   def __repr__(self):
@@ -581,6 +655,7 @@ class AllocaInstruction(Instruction):
     Instruction.__init__(self)
     self.size = context.GetValueRelative(record.values[0])
     self.alignment = (1 << record.values[1]) >> 1
+    self.type = IntegerType(32)
 
   def Repr(self):
     return 'Alloca %s align=%d' % (self.size, self.alignment)
@@ -601,6 +676,7 @@ class StoreInstruction(Instruction):
     self.dest = context.GetValueRelative(record.values[0])
     self.value = context.GetValueRelative(record.values[1])
     self.alignment = (1 << record.values[2]) >> 1
+    self.type = self.value.type
 
   def HasValue(self):
     return False
@@ -621,12 +697,12 @@ class CallInstruction(Instruction):
 
     value_gen = (x for x in record.values[2:])
     if is_indirect:
-      self.rettype = context.types[next(value_gen)]
+      self.type = context.types[next(value_gen)]
     else:
-      self.type = self.callee.function.type
-      self.rettype = self.type.rettype
+      self.function_type = self.callee.function.type
+      self.type = self.function_type.rettype
 
-      if not isinstance(self.type, FunctionType):
+      if not isinstance(self.function_type, FunctionType):
         raise Error('Expected function type')
 
     self.args = []
@@ -634,7 +710,7 @@ class CallInstruction(Instruction):
       self.args.append(context.GetValueRelative(value))
 
   def HasValue(self):
-    return not isinstance(self.rettype, VoidType)
+    return not isinstance(self.type, VoidType)
 
   def Repr(self):
     if self.args:
@@ -643,18 +719,16 @@ class CallInstruction(Instruction):
       arg_str = ''
 
     if self.is_indirect:
-      return 'CallIndirect %s%s' % (self.callee, arg_str)
+      return 'CallIndirect %s %s%s' % (self.type, self.callee, arg_str)
     else:
       if self.callee.function.name:
         # If we have a name its probably an intrinsic. The type doesn't
         # really help any.
-        return 'Call %s%s' % (self.callee.function.name, arg_str)
-      return 'Call %%%s%s' % (self.callee.function.index, arg_str)
+        return 'Call %s %s%s' % (self.type, self.callee.function.name, arg_str)
+      return 'Call %s %%%s%s' % (self.type, self.callee.function.index, arg_str)
 
 
-
-# Blocks ######################################################################
-
+## Blocks ##
 
 class ModuleBlock(object):
   def __init__(self, block, context):
@@ -727,9 +801,9 @@ class TypeBlock(object):
     elif record.code == TYPE_CODE_DOUBLE:
       context.types.append(DoubleType())
     elif record.code == TYPE_CODE_INTEGER:
-      context.types.append(IntegerType(record))
+      context.types.append(IntegerType.FromRecord(record))
     elif record.code == TYPE_CODE_FUNCTION:
-      context.types.append(FunctionType(record, context))
+      context.types.append(FunctionType.FromRecord(record, context))
     elif record.code == TYPE_CODE_NUMENTRY:
       return
     else:
@@ -810,13 +884,15 @@ class FunctionBlock(object):
 
     # Copy all values from context
     self.function.values = context.FunctionValues()
+    self.function.value_idx_offset = context.values_mark
 
   def AppendFunctionArgValues(self, context):
     func_type = self.function.type
     if not isinstance(func_type, FunctionType):
       raise Error('Expected function type')
-    for i, argtype in enumerate(func_type.argtypes):
-      context.AppendValue(FunctionArgValue(i, argtype))
+    for argtype in func_type.argtypes:
+      idx = len(context.values)
+      context.AppendValue(FunctionArgValue(idx, argtype))
 
   def ParseBlock(self, block, context):
     bid = block._id
