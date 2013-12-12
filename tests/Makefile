@@ -15,7 +15,8 @@ include $(NACL_SDK_ROOT)/tools/common.mk
 LIBS = $(DEPS) ppapi pthread
 CFLAGS = -Wall
 
-TARGETS = simple hello_world
+TARGETS = fact simple hello_world
+fact_SOURCES = fact.c
 simple_SOURCES = simple.c
 hello_world_SOURCES = hello_world.c
 
