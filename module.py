@@ -140,13 +140,52 @@ class Error(Exception):
   pass
 
 
+class Deferred(object):
+  def __init__(self):
+    self.value = None
+    self.callbacks = []
+
+  def Defer(self, callback):
+    if self.value is not None:
+      callback(self.value)
+      return
+    self.callbacks.append(callback)
+
+  def Resolve(self, value):
+    assert self.value is None
+    self.value = value
+    for callback in self.callbacks:
+      callback(self.value)
+    self.callbacks = None
+
+
+class CallAfter(object):
+  def __init__(self, to_call, expected):
+    self.to_call = to_call
+    self.expected = expected
+    self.calls = 0
+
+  def Wrap(self, callback):
+    def NewCallback(value):
+      assert self.calls < self.expected
+      if callback:
+        callback(value)
+      self.calls += 1
+      if self.calls == self.expected:
+        self.to_call()
+    return NewCallback
+
+  def Callback(self):
+    return self.Wrap(None)
+
+
 class Context(object):
   def __init__(self):
     self.values_mark = None
     self.use_relative_ids = None
     self.types = []
     self.values = []
-    self.value_fixups = {}
+    self.deferred = {}
     # This will be a reference to a list of all basic blocks for the
     # function currently being parsed
     self.basic_blocks = None
@@ -169,19 +208,17 @@ class Context(object):
   def AppendValue(self, value):
     self.values.append(value)
     new_idx = len(self.values) - 1
-    self.FixupValues(new_idx, value)
+    if new_idx in self.deferred:
+      self.deferred[new_idx].Resolve(value)
+      del self.deferred[new_idx]
 
-  def FixupValues(self, idx, value):
-    if idx in self.value_fixups:
-      for fn in self.value_fixups[idx]:
-        fn(value)
-      del self.value_fixups[idx]
-
-  def GetOrCreateValue(self, idx, fixup_fn):
+  def GetValue(self, idx, callback):
     if idx >= len(self.values):
-      self.value_fixups.setdefault(idx, []).append(fixup_fn)
-      return None
-    return self.values[idx]
+      self.deferred.setdefault(idx, Deferred()).Defer(callback)
+      return
+
+    # Value is available now, call the callback immediately.
+    callback(self.values[idx])
 
   def GetRelativeIndex(self, idx):
     if not self.use_relative_ids:
@@ -190,20 +227,18 @@ class Context(object):
     # record values are always unsigned 64-bit. Treat idx as a 32-bit
     # signed value.
     if idx >= 0x80000000:
-      idx = 0x100000000 - idx
+      idx = idx - 0x100000000
     return len(self.values) - idx
 
-  def GetValueRelative(self, idx):
-    return self.values[self.GetRelativeIndex(idx)]
-
-  def GetOrCreateValueRelative(self, idx, fixup_fn):
-    return self.GetOrCreateValue(self.GetRelativeIndex(idx), fixup_fn)
+  def GetValueRelative(self, idx, callback):
+    self.GetValue(self.GetRelativeIndex(idx), callback)
 
 
 ## Values ##
 
 class Value(object):
-  pass
+  def GetType(self, callback):
+    callback(self.type)
 
 class FunctionValue(Value):
   def __init__(self, function):
@@ -255,8 +290,13 @@ class InstructionValue(Value):
   def __init__(self, inst):
     self.inst = inst
     self.type = None
-    if self.inst.HasValue():
-      self.type = self.inst.type
+    self.GetType(self._SetType)
+
+  def _SetType(self, typ):
+    self.type = typ
+
+  def GetType(self, callback):
+    self.inst.GetType(callback)
 
   def __repr__(self):
     if self.type:
@@ -384,11 +424,12 @@ class DataInitializer(Initializer):
 
 class RelocInitializer(Initializer):
   def __init__(self, record, context):
-    def fixup(value):
+    def callback(value):
       self.base_val = value
 
     idx = record.values[0]
-    self.base_val = context.GetOrCreateValue(idx, fixup)
+    self.base_val = None
+    context.GetValue(idx, callback)
     self.addend = 0
     if len(record.values) == 2:
       self.addend = record.values[1]
@@ -430,12 +471,17 @@ class BasicBlock(object):
 class Instruction(object):
   def __init__(self):
     self.value_idx = None
+    self.type = None
+    self.deferred_type = Deferred()
 
   def IsTerminator(self):
     return False
 
   def HasValue(self):
     return True
+
+  def GetType(self, callback):
+    callback(self.type)
 
   def __repr__(self):
     if self.value_idx is not None:
@@ -448,8 +494,11 @@ class Instruction(object):
 class BinOpInstruction(Instruction):
   def __init__(self, record, context):
     Instruction.__init__(self)
-    self.opval0 = context.GetValueRelative(record.values[0])
-    self.opval1 = context.GetValueRelative(record.values[1])
+    self.opval0 = None
+    self.opval1 = None
+    callafter = CallAfter(self._CheckOpvals, 2)
+    context.GetValueRelative(record.values[0], callafter.Wrap(self._SetOpval0))
+    context.GetValueRelative(record.values[1], callafter.Wrap(self._SetOpval1))
     self.opcode = record.values[2]
     if len(record.values) == 4:
       flags = record.values[3]
@@ -462,10 +511,51 @@ class BinOpInstruction(Instruction):
         # TODO(binji): handle fast-math flags.
         pass
 
-    if self.opval0.type != self.opval1.type:
-      raise Error('BinOp with different types: %s %s' % (
+  def _SetOpval0(self, value):
+    self.opval0 = value
+
+  def _SetOpval1(self, value):
+    self.opval1 = value
+
+  def GetType(self, callback):
+    self.deferred_type.Defer(callback)
+
+  def _CheckOpvals(self):
+    callafter = CallAfter(self._CheckTypes, 2)
+    self.opval0.GetType(callafter.Callback())
+    self.opval1.GetType(callafter.Callback())
+
+  def _CheckTypes(self):
+    NumericTypes = (IntegerType, FloatType, DoubleType)
+    isnum0 = isinstance(self.opval0.type, NumericTypes)
+    isnum1 = isinstance(self.opval1.type, NumericTypes)
+
+    if not (isnum0 and isnum1):
+      raise Error('BinOp with non-numeric types: %s %s' % (
           self.opval0.type, self.opval1.type))
-    self.type = self.opval0.type
+
+    type0 = self.opval0.type
+    type1 = self.opval1.type
+    isint0 = isinstance(type0, IntegerType)
+    isint1 = isinstance(type1, IntegerType)
+    if type0 == type1:
+      self.type = type0
+    elif isint0 and isint1:
+      # Integer operation
+      if type0.width >= type1.width:
+        self.type = type0
+      else:
+        self.type = type1
+    elif not (isint0 and isint1):
+      # Float operation, types are different so one must be a double.
+      if isinstance(type0, DoubleType):
+        self.type = type0
+      else:
+        self.type = type1
+    else:
+      raise Error('BinOp with incompatible types: %s %s' % (
+          self.opval0.type, self.opval1.type))
+    self.deferred_type.Resolve(self.type)
 
   def Repr(self):
     return 'BinOp %s %s %s' % (
@@ -473,8 +563,11 @@ class BinOpInstruction(Instruction):
 
 class CastInstruction(Instruction):
   def __init__(self, record, context):
+    def callback(value):
+      self.opval = value
+
     Instruction.__init__(self)
-    self.opval = context.GetValueRelative(record.values[0])
+    context.GetValueRelative(record.values[0], callback)
     self.type = context.types[record.values[1]]
     self.opcode = record.values[2]
 
@@ -484,13 +577,38 @@ class CastInstruction(Instruction):
 class VSelectInstruction(Instruction):
   def __init__(self, record, context):
     Instruction.__init__(self)
-    self.trueval = context.GetValueRelative(record.values[0])
-    self.falseval = context.GetValueRelative(record.values[1])
-    self.cond = context.GetValueRelative(record.values[2])
+    self.trueval = None
+    self.falseval = None
+    self.cond = None
+    callafter = CallAfter(self._CheckValues, 2)
+    context.GetValueRelative(record.values[0], callafter.Wrap(self._SetTrueval))
+    context.GetValueRelative(record.values[1],
+                             callafter.Wrap(self._SetFalseval))
+    context.GetValueRelative(record.values[2], self._SetCond)
+
+  def _SetTrueval(self, value):
+    self.trueval = value
+
+  def _SetFalseval(self, value):
+    self.falseval = value
+
+  def _SetCond(self, value):
+    self.cond = value
+
+  def GetType(self, callback):
+    self.deferred_type.Defer(callback)
+
+  def _CheckValues(self):
+    callafter = CallAfter(self._CheckTypes, 2)
+    self.trueval.GetType(callafter.Callback())
+    self.trueval.GetType(callafter.Callback())
+
+  def _CheckTypes(self):
     if self.trueval.type != self.trueval.type:
       raise Error('VSelect with different types: %s %s' % (
           self.trueval.type, self.trueval.type))
     self.type = self.trueval.type
+    self.deferred_type.Resolve(self.type)
 
   def Repr(self):
     return 'VSelect %s ? %s : %s' % (self.cond, self.trueval, self.falseval)
@@ -498,9 +616,28 @@ class VSelectInstruction(Instruction):
 class Cmp2Instruction(Instruction):
   def __init__(self, record, context):
     Instruction.__init__(self)
-    self.opval0 = context.GetValueRelative(record.values[0])
-    self.opval1 = context.GetValueRelative(record.values[1])
+    self.opval0 = None
+    self.opval1 = None
+    callafter = CallAfter(self._CheckOpvals, 2)
+    context.GetValueRelative(record.values[0], callafter.Wrap(self._SetOpval0))
+    context.GetValueRelative(record.values[1], callafter.Wrap(self._SetOpval1))
     self.predicate = record.values[2]
+
+  def _SetOpval0(self, value):
+    self.opval0 = value
+
+  def _SetOpval1(self, value):
+    self.opval1 = value
+
+  def GetType(self, callback):
+    self.deferred_type.Defer(callback)
+
+  def _CheckOpvals(self):
+    callafter = CallAfter(self._CheckTypes, 2)
+    self.opval0.GetType(callafter.Callback())
+    self.opval1.GetType(callafter.Callback())
+
+  def _CheckTypes(self):
     if self.opval0.type == self.opval1.type:
       self.type = self.opval0.type
     elif ((isinstance(self.opval0.type, FunctionType) and
@@ -511,7 +648,7 @@ class Cmp2Instruction(Instruction):
     else:
       raise Error('Cmp2 with incompatible types: %s %s' % (
           self.opval0.type, self.opval1.type))
-    self.type = self.opval0.type
+    self.deferred_type.Resolve(self.type)
 
   def Repr(self):
     return 'Cmp %s %s %s' % (cmp_name[self.predicate], self.opval0, self.opval1)
@@ -521,7 +658,10 @@ class RetInstruction(Instruction):
     Instruction.__init__(self)
     self.opval = None
     if len(record.values) == 1:
-      self.opval = context.GetValueRelative(record.values[0])
+      context.GetValueRelative(record.values[0], self._SetOpval)
+
+  def _SetOpval(self, value):
+    self.opval = value
 
   def IsTerminator(self):
     return True
@@ -542,7 +682,10 @@ class BrInstruction(Instruction):
     self.false_bb = None
     if len(record.values) > 1:
       self.false_bb = record.values[1]
-      self.cond = context.GetValueRelative(record.values[2])
+      context.GetValueRelative(record.values[2], self._SetCond)
+
+  def _SetCond(self, value):
+    self.cond = value
 
   def IsTerminator(self):
     return True
@@ -559,13 +702,17 @@ class SwitchInstruction(Instruction):
   def __init__(self, record, context):
     Instruction.__init__(self)
     self.type = context.types[record.values[0]]
-    self.cond = context.GetValueRelative(record.values[1])
+    self.cond = None
+    context.GetValueRelative(record.values[1], self._SetCond)
     self.default_bb = record.values[2]
     value_gen = (x for x in record.values[3:])
     self.cases = []
     num_cases = next(value_gen)
     for _ in range(num_cases):
       self.cases.append(SwitchCase(value_gen))
+
+  def _SetCond(self, value):
+    self.cond = value
 
   def IsTerminator(self):
     return True
@@ -634,18 +781,18 @@ class PhiInstruction(Instruction):
 
 class PhiIncoming(object):
   def __init__(self, value_gen, context):
-    def fixup(value):
-      self.value = value
-      self.type = self.value.type
-
+    self.value = None
+    self.type = None
     if context.use_relative_ids:
       idx = DecodeSignRotatedValue(next(value_gen))
-      self.value = context.GetOrCreateValueRelative(idx, fixup)
+      context.GetValueRelative(idx, self._SetValue)
     else:
-      self.value = context.GetOrCreateValue(idx, fixup)
-    if self.value:
-      self.type = self.value.type
+      context.GetValue(idx, self._SetValue)
     self.bb = next(value_gen)
+
+  def _SetValue(self, value):
+    self.value = value
+    self.type = self.value.type
 
   def __repr__(self):
     return '<%s => %s>' % (self.bb, self.value)
@@ -653,9 +800,13 @@ class PhiIncoming(object):
 class AllocaInstruction(Instruction):
   def __init__(self, record, context):
     Instruction.__init__(self)
-    self.size = context.GetValueRelative(record.values[0])
+    self.size = None
+    context.GetValueRelative(record.values[0], self._SetSize)
     self.alignment = (1 << record.values[1]) >> 1
     self.type = IntegerType(32)
+
+  def _SetSize(self, value):
+    self.size = value
 
   def Repr(self):
     return 'Alloca %s align=%d' % (self.size, self.alignment)
@@ -663,9 +814,13 @@ class AllocaInstruction(Instruction):
 class LoadInstruction(Instruction):
   def __init__(self, record, context):
     Instruction.__init__(self)
-    self.source = context.GetValueRelative(record.values[0])
+    self.source = None
+    context.GetValueRelative(record.values[0], self._SetSource)
     self.alignment = (1 << record.values[1]) >> 1
     self.type = context.types[record.values[2]]
+
+  def _SetSource(self, value):
+    self.source = value
 
   def Repr(self):
     return 'Load %s <= %s align=%d' % (self.type, self.source, self.alignment)
@@ -673,10 +828,22 @@ class LoadInstruction(Instruction):
 class StoreInstruction(Instruction):
   def __init__(self, record, context):
     Instruction.__init__(self)
-    self.dest = context.GetValueRelative(record.values[0])
-    self.value = context.GetValueRelative(record.values[1])
+    self.dest = None
+    self.value = None
+    context.GetValueRelative(record.values[0], self._SetDest)
+    context.GetValueRelative(record.values[1], self._SetValue)
     self.alignment = (1 << record.values[2]) >> 1
+
+  def _SetDest(self, value):
+    self.dest = value
+
+  def _SetValue(self, value):
+    self.value = value
     self.type = self.value.type
+    self.deferred_type.Resolve(self.type)
+
+  def GetType(self, callback):
+    self.deferred_type.Defer(callback)
 
   def HasValue(self):
     return False
@@ -691,23 +858,40 @@ class CallInstruction(Instruction):
     cc_info = record.values[0]
     self.is_tail_call = (cc_info & 1) != 0
     self.calling_conv = cc_info >> 1
-    self.callee = context.GetValueRelative(record.values[1])
-    if not is_indirect and not isinstance(self.callee, FunctionValue):
-      raise Error('Expected function value')
+    self.callee = None
+    context.GetValueRelative(record.values[1], self._SetCallee)
 
+    self.function_type = None
     value_gen = (x for x in record.values[2:])
     if is_indirect:
       self.type = context.types[next(value_gen)]
-    else:
-      self.function_type = self.callee.function.type
-      self.type = self.function_type.rettype
-
-      if not isinstance(self.function_type, FunctionType):
-        raise Error('Expected function type')
+      self.deferred_type.Resolve(self.type)
 
     self.args = []
     for value in value_gen:
-      self.args.append(context.GetValueRelative(value))
+      context.GetValueRelative(value, self._AppendArg)
+
+  def _SetCallee(self, value):
+    self.callee = value
+    self._CheckTypes()
+
+  def _AppendArg(self, value):
+    self.args.append(value)
+
+  def GetType(self, callback):
+    self.deferred_type.Defer(callback)
+
+  def _CheckTypes(self):
+    if not self.is_indirect:
+      if not isinstance(self.callee, FunctionValue):
+        raise Error('Expected function value')
+
+      self.function_type = self.callee.function.type
+      self.type = self.function_type.rettype
+      self.deferred_type.Resolve(self.type)
+
+      if not isinstance(self.function_type, FunctionType):
+        raise Error('Expected function type')
 
   def HasValue(self):
     return not isinstance(self.type, VoidType)

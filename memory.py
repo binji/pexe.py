@@ -14,6 +14,24 @@ U64 = 4
 F32 = 5
 F64 = 6
 
+TYPE_TO_PACK_FMT = {
+  U8: '<B',
+  U16: '<H',
+  U32: '<L',
+  U64: '<Q',
+  F32: '<f',
+  F64: '<d',
+}
+
+SIZEOF_TYPE = {
+  U8: 1,
+  U16: 2,
+  U32: 4,
+  U64: 8,
+  F32: 4,
+  F64: 8,
+}
+
 
 def IsPowerOfTwo(n):
   return n & (n - 1) == 0
@@ -36,7 +54,30 @@ def ReadCString(memory, offset):
 
 
 class Memory(object):
+  def Read(self, typ, offset):
+    raise NotImplementedError()
+
+  def Write(self, typ, offset, value):
+    raise NotImplementedError()
+
+  def ReadU8(self, offset):  return self.Read(U8, offset)
+  def ReadU16(self, offset): return self.Read(U16, offset)
+  def ReadU32(self, offset): return self.Read(U32, offset)
+  def ReadU64(self, offset): return self.Read(U64, offset)
+  def ReadF32(self, offset): return self.Read(F32, offset)
+  def ReadF64(self, offset): return self.Read(F64, offset)
+
+  def WriteU8(self, offset, value):  self.Write(U8, offset, value)
+  def WriteU16(self, offset, value): self.Write(U16, offset, value)
+  def WriteU32(self, offset, value): self.Write(U32, offset, value)
+  def WriteU64(self, offset, value): self.Write(U64, offset, value)
+  def WriteF32(self, offset, value): self.Write(F32, offset, value)
+  def WriteF64(self, offset, value): self.Write(F64, offset, value)
+
+
+class MemoryBuffer(Memory):
   def __init__(self, num_bytes):
+    Memory.__init__(self)
     self.data = ctypes.create_string_buffer(num_bytes)
     self.num_bytes = num_bytes
 
@@ -46,95 +87,19 @@ class Memory(object):
     self.data = new_data
     self.num_bytes = new_num_bytes
 
-  def ReadU8(self, offset):
-    return struct.unpack_from('<B', self.data, offset)[0]
-
-  def ReadU16(self, offset):
-    return struct.unpack_from('<H', self.data, offset)[0]
-
-  def ReadU32(self, offset):
-    return struct.unpack_from('<L', self.data, offset)[0]
-
-  def ReadU64(self, offset):
-    return struct.unpack_from('<Q', self.data, offset)[0]
-
-  def ReadF32(self, offset):
-    return struct.unpack_from('<f', self.data, offset)[0]
-
-  def ReadF64(self, offset):
-    return struct.unpack_from('<d', self.data, offset)[0]
-
-  ReadFuncs = {
-      U8: ReadU8,
-      U16: ReadU16,
-      U32: ReadU32,
-      U64: ReadU64,
-      F32: ReadF32,
-      F64: ReadF64
-  }
-
   def Read(self, typ, offset):
-    return Memory.ReadFuncs[typ](self, offset)
-
-  def WriteU8(self, offset, value):
-    struct.pack_into('<B', self.data, offset, value)
-
-  def WriteU16(self, offset, value):
-    struct.pack_into('<H', self.data, offset, value)
-
-  def WriteU32(self, offset, value):
-    struct.pack_into('<L', self.data, offset, value)
-
-  def WriteU64(self, offset, value):
-    struct.pack_into('<Q', self.data, offset, value)
-
-  def WriteF32(self, offset, value):
-    struct.pack_into('<f', self.data, offset, value)
-
-  def WriteF64(self, offset, value):
-    struct.pack_into('<d', self.data, offset, value)
-
-  WriteFuncs = {
-      U8: WriteU8,
-      U16: WriteU16,
-      U32: WriteU32,
-      U64: WriteU64,
-      F32: WriteF32,
-      F64: WriteF64
-  }
+    return struct.unpack_from(TYPE_TO_PACK_FMT[typ], self.data, offset)[0]
 
   def Write(self, typ, offset, value):
-    Memory.WriteFuncs[typ](self, offset, value)
-
-  def __repr__(self):
-    return str(map(ord, self.data))
+    struct.pack_into(TYPE_TO_PACK_FMT[typ], self.data, offset, value)
 
 
-class NullMemory(object):
-  def _Read(self, offset):
-    return 0
-
-  def _Write(self, offset, value):
-    pass
-
+class NullMemory(Memory):
   def Read(self, typ, offset):
     return 0
 
   def Write(self, typ, offset, value):
     pass
-
-  ReadU8 = _Read
-  ReadU16 = _Read
-  ReadU32 = _Read
-  ReadU64 = _Read
-  ReadF32 = _Read
-  ReadF64 = _Read
-  WriteU8 = _Write
-  WriteU16 = _Write
-  WriteU32 = _Write
-  WriteU64 = _Write
-  WriteF32 = _Write
-  WriteF64 = _Write
 
 
 class MemoryWriter(object):
@@ -142,29 +107,16 @@ class MemoryWriter(object):
     self.offset = offset
     self.memory = memory
 
-  def WriteU8(self, value):
-    self.memory.WriteU8(self.offset, value)
-    self.offset += 1
+  def Write(self, typ, value):
+    self.memory.Write(typ, self.offset, value)
+    self.offset += SIZEOF_TYPE[typ]
 
-  def WriteU16(self, value):
-    self.memory.WriteU16(self.offset, value)
-    self.offset += 2
-
-  def WriteU32(self, value):
-    self.memory.WriteU32(self.offset, value)
-    self.offset += 4
-
-  def WriteU64(self, value):
-    self.memory.WriteU64(self.offset, value)
-    self.offset += 8
-
-  def WriteF32(self, value):
-    self.memory.WriteF32(self.offset, value)
-    self.offset += 4
-
-  def WriteF64(self, value):
-    self.memory.WriteF64(self.offset, value)
-    self.offset += 8
+  def WriteU8(self, value):  self.Write(U8, value)
+  def WriteU16(self, value): self.Write(U16, value)
+  def WriteU32(self, value): self.Write(U32, value)
+  def WriteU64(self, value): self.Write(U64, value)
+  def WriteF32(self, value): self.Write(F32, value)
+  def WriteF64(self, value): self.Write(F64, value)
 
   def Skip(self, num_bytes):
     self.offset += num_bytes

@@ -4,6 +4,7 @@
 # found in the LICENSE file.
 
 import copy
+import ctypes
 import optparse
 import sys
 
@@ -30,12 +31,16 @@ def extend(cls):
         raise module.Error('Overwriting existing definition %s in %s' % (
                            name, cls))
       setattr(cls, name, fn)
+    return cls
   return decorator
 
 def log_fn(fn):
   def decorator(*args):
-    arg_kv = ', '.join('%s=%r' % (fn.__code__.co_varnames[i], args[i])
-                       for i in range(len(args)))
+    try:
+      arg_kv = ', '.join('%s=%r' % (fn.__code__.co_varnames[i], args[i])
+                         for i in range(len(args)))
+    except IndexError:
+      arg_kv = '???'
     print '>>> %s(%s)' % (fn.__name__, arg_kv)
     return fn(*args)
   return decorator
@@ -62,20 +67,21 @@ class ModuleBlock(object):
 
   def GetMemSize(self, argv=None, envp=None):
     writer = memory.MemoryWriter(memory.NullMemory())
-    return self.InitializeMemory(writer, argv, envp)
+    return self.InitializeMemory(writer, argv, envp)[1]
 
   def InitializeMemory(self, writer, argv=None, envp=None):
     argv = argv or []
     envp = envp or []
 
     fixups = []
-    writer.WriteU32(0)  # For NULL address
+    writer.Skip(4)  # For NULL address
     self._WriteStartInfo(writer, argv, envp)
-    self._WriteAll(self.Constants(), writer, fixups)
     self._WriteAll(self.NonConsts(), writer, fixups)
+    constants_offset = writer.offset
+    self._WriteAll(self.Constants(), writer, fixups)
     for fixup in fixups:
       fixup()
-    return writer.offset
+    return constants_offset, writer.offset
 
   def _WriteStartInfo(self, writer, argv, envp):
     # From nacl_startup.h in the native_client repo:
@@ -144,6 +150,8 @@ class ModuleBlock(object):
   def _WriteAll(self, generator, writer, fixups):
     for var in generator:
       writer.Align(var.alignment)
+      if writer.offset:
+        print '%%%d: %s' % (writer.offset, var)
       var.Write(writer, fixups)
 
 
@@ -182,14 +190,17 @@ class DataInitializer(object):
 class RelocInitializer(object):
   def Write(self, writer, fixups):
     offset = writer.offset
-
     def FixupFn():
       if isinstance(self.base_val, module.GlobalVarValue):
-        writer.memory.WriteU32(offset, self.base_val.var.offset)
+        value = self.base_val.var.offset
       elif isinstance(self.base_val, module.FunctionValue):
-        writer.memory.WriteU32(offset, self.base_val.function.index)
+        value = self.base_val.function.index
       else:
         raise module.Error('Unknown reloc base_val %s' % self.base_val)
+
+      if self.addend:
+        value += self.addend
+      writer.memory.WriteU32(offset, value)
 
     fixups.append(FixupFn)
     writer.Skip(4)
@@ -198,19 +209,21 @@ class RelocInitializer(object):
 @extend(module.IntegerConstantValue)
 class IntegerConstantValue(object):
   def GetValue(self, context):
-    return self.value
+    return self.type.CastValue(self.value)
 
 
 @extend(module.InstructionValue)
 class InstructionValue(object):
   def GetValue(self, context):
-    return context.GetValue(self.inst.value_idx)
+    value = context.GetValue(self.inst.value_idx)
+    return self.type.CastValue(value)
 
 
 @extend(module.FunctionArgValue)
 class FunctionArgValue(object):
   def GetValue(self, context):
-    return context.GetValue(self.value_idx)
+    value = context.GetValue(self.value_idx)
+    return self.type.CastValue(value)
 
 
 @extend(module.GlobalVarValue)
@@ -218,12 +231,52 @@ class GlobalVarValue(object):
   def GetValue(self, context):
     return self.var.offset
 
+
 @extend(module.FunctionValue)
 class FunctionValue(object):
   def GetValue(self, context):
     # Get the "address" of this function. Because the function doesn't
-    # actually exist in memory, we just the index as an ID.
+    # actually exist in memory, we just use the index as an ID.
     return self.function.index
+
+
+@extend(module.IntegerType)
+class IntegerType(object):
+  def _GetSignedCtype(self):
+    return {
+      8: ctypes.c_int8,
+      16: ctypes.c_int16,
+      32: ctypes.c_int32,
+      64: ctypes.c_int64,
+    }[self.width]
+
+  def _GetUnsignedCtype(self):
+    return {
+      8: ctypes.c_uint8,
+      16: ctypes.c_uint16,
+      32: ctypes.c_uint32,
+      64: ctypes.c_uint64,
+    }[self.width]
+
+  def CastValue(self, value, signed=False):
+    if self.width == 1:
+      return value & 1
+    elif signed:
+      return self._GetSignedCtype()(value).value
+    else:
+      return self._GetUnsignedCtype()(value).value
+
+
+@extend(module.FloatType)
+class FloatType(object):
+  def CastValue(self, value):
+    return ctypes.c_float(value).value
+
+
+@extend(module.DoubleType)
+class DoubleType(object):
+  def CastValue(self, value):
+    return ctypes.c_double(value).value
 
 
 @extend(module.AllocaInstruction)
@@ -231,8 +284,11 @@ class AllocaInstruction(object):
   def Execute(self, context):
     size = self.size.GetValue(context)
     address = context.stack.Alloca(size, self.alignment)
-    context.SetValue(self.value_idx, address)
+    context.SetValue(self.type, self.value_idx, address)
     context.location.NextInstruction()
+
+  def GetValues(self):
+    return [self.size]
 
 def ModuleTypeToMemoryType(typ):
   if isinstance(typ, module.IntegerType):
@@ -260,10 +316,11 @@ class StoreInstruction(object):
     value = self.value.GetValue(context)
     typ = ModuleTypeToMemoryType(self.type)
     mem, address = context.GetMemoryFromAddress(address)
-    if address == 0:
-      raise module.Error('Writing to NULL pointer')
     mem.Write(typ, address, value)
     context.location.NextInstruction()
+
+  def GetValues(self):
+    return [self.value, self.dest]
 
 
 @extend(module.LoadInstruction)
@@ -272,11 +329,12 @@ class LoadInstruction(object):
     address = self.source.GetValue(context)
     typ = ModuleTypeToMemoryType(self.type)
     mem, address = context.GetMemoryFromAddress(address)
-    if address == 0:
-      raise module.Error('Reading from NULL pointer')
     value = mem.Read(typ, address)
-    context.SetValue(self.value_idx, value)
+    context.SetValue(self.type, self.value_idx, value)
     context.location.NextInstruction()
+
+  def GetValues(self):
+    return [self.source]
 
 
 @extend(module.BinOpInstruction)
@@ -294,12 +352,17 @@ class BinOpInstruction(object):
       value = opval0 | opval1
     elif self.opcode == module.BINOP_AND:
       value = opval0 & opval1
+    elif self.opcode == module.BINOP_XOR:
+      value = opval0 ^ opval1
     elif self.opcode == module.BINOP_SHL:
       value = opval0 << opval1
     else:
       raise module.Error('Unimplemented binop: %s' % self.opcode)
-    context.SetValue(self.value_idx, value)
+    context.SetValue(self.type, self.value_idx, value)
     context.location.NextInstruction()
+
+  def GetValues(self):
+    return [self.opval0, self.opval1]
 
 
 @extend(module.BrInstruction)
@@ -316,6 +379,11 @@ class BrInstruction(object):
       next_bb = self.false_bb
     context.location.GotoBlock(next_bb)
 
+  def GetValues(self):
+    if self.cond:
+      return [self.cond]
+    return []
+
 
 @extend(module.PhiInstruction)
 class PhiInstruction(object):
@@ -327,8 +395,11 @@ class PhiInstruction(object):
         break
     else:
       raise module.Error('Unknown incoming bb: %s' % last_bb_idx)
-    context.SetValue(self.value_idx, value)
+    context.SetValue(self.type, self.value_idx, value)
     context.location.NextInstruction()
+
+  def GetValues(self):
+    return [i.value for i in self.incoming]
 
 
 @extend(module.SwitchInstruction)
@@ -342,18 +413,26 @@ class SwitchInstruction(object):
           return
     context.location.GotoBlock(self.default_bb)
 
+  def GetValues(self):
+    return [self.cond]
+
 
 @extend(module.CastInstruction)
 class CastInstruction(object):
   def Execute(self, context):
     opval = self.opval.GetValue(context)
+
     if self.opcode in (module.CAST_TRUNC, module.CAST_ZEXT):
-      assert isinstance(self.type, module.IntegerType)
-      value = opval & ((1 << self.type.width) - 1)
+      value = opval
+    elif self.opcode == module.CAST_SEXT:
+      value = self.opval.type.CastValue(opval, signed=True)
     else:
       raise module.Error('Unimplemented cast: %s' % self.opcode)
-    context.SetValue(self.value_idx, value)
+    context.SetValue(self.type, self.value_idx, value)
     context.location.NextInstruction()
+
+  def GetValues(self):
+    return [self.opval]
 
 
 @extend(module.Cmp2Instruction)
@@ -361,22 +440,47 @@ class Cmp2Instruction(object):
   def Execute(self, context):
     opval0 = self.opval0.GetValue(context)
     opval1 = self.opval1.GetValue(context)
-    if self.predicate == module.ICMP_EQ:
-      assert type(opval0) in (int, long)
-      assert type(opval1) in (int, long)
-      value = 1 if opval0 == opval1 else 0
-    elif self.predicate == module.ICMP_SGT:
-      assert type(opval0) in (int, long)
-      assert type(opval1) in (int, long)
-      value = 1 if opval0 > opval1 else 0
-    elif self.predicate == module.ICMP_UGT:
-      assert type(opval0) in (int, long)
-      assert type(opval1) in (int, long)
-      value = 1 if opval0 > opval1 else 0
-    else:
+
+    value = None
+    if module.ICMP_EQ <= self.predicate <= module.ICMP_ULE:
+      opval0 = self.opval0.GetValue(context)
+      opval1 = self.opval1.GetValue(context)
+      if self.predicate == module.ICMP_EQ:
+        value = 1 if opval0 == opval1 else 0
+      elif self.predicate == module.ICMP_NE:
+        value = 1 if opval0 != opval1 else 0
+      elif self.predicate == module.ICMP_UGT:
+        value = 1 if opval0 > opval1 else 0
+      elif self.predicate == module.ICMP_UGE:
+        value = 1 if opval0 >= opval1 else 0
+      elif self.predicate == module.ICMP_ULT:
+        value = 1 if opval0 < opval1 else 0
+      elif self.predicate == module.ICMP_ULE:
+        value = 1 if opval0 <= opval1 else 0
+    elif module.ICMP_SGT <= self.predicate <= module.ICMP_SLE:
+      opval0 = self.opval0.GetValue(context)
+      opval1 = self.opval1.GetValue(context)
+      # TODO(binji): cleaner way to do this?
+      opval0 = self.opval0.type.CastValue(opval0, signed=True)
+      opval1 = self.opval1.type.CastValue(opval1, signed=True)
+
+      if self.predicate == module.ICMP_SGT:
+        value = 1 if opval0 > opval1 else 0
+      elif self.predicate == module.ICMP_SGE:
+        value = 1 if opval0 >= opval1 else 0
+      elif self.predicate == module.ICMP_SLT:
+        value = 1 if opval0 < opval1 else 0
+      elif self.predicate == module.ICMP_SLE:
+        value = 1 if opval0 <= opval1 else 0
+
+    if value is None:
       raise module.Error('Unimplemented cmp2: %s' % self.predicate)
-    context.SetValue(self.value_idx, value)
+
+    context.SetValue(self.type, self.value_idx, value)
     context.location.NextInstruction()
+
+  def GetValues(self):
+    return [self.opval0, self.opval1]
 
 
 @extend(module.CallInstruction)
@@ -393,7 +497,7 @@ class CallInstruction(object):
         # This is a built-in function (IRT)
         function_idx &= ~FN_HIGH_BIT
         result = builtin_functions[function_idx](context, *values)
-        context.SetValue(self.value_idx, result)
+        context.SetValue(self.type, self.value_idx, result)
         context.location.NextInstruction()
         return
 
@@ -409,14 +513,24 @@ class CallInstruction(object):
           raise module.Error('Unimplemented intrinsic: %s' % function.name)
 
         result = intrinsic(context, *values)
-        if result:
-          context.SetValue(self.value_idx, result)
+        if result is not None:
+          context.SetValue(self.type, self.value_idx, result)
         context.location.NextInstruction()
         return
 
+    if function.is_proto:
+      raise module.Error('Attempting to call prototype %s' % function)
+
     context.EnterFunction(function)
-    for i, value in enumerate(values):
-      context.SetArgValue(i, value)
+    for i, typ in enumerate(function.type.argtypes):
+      context.SetArgValue(typ, i, values[i])
+
+  def GetValues(self):
+    result = []
+    if self.is_indirect:
+      result.append(self.callee)
+    result.extend(self.args)
+    return result
 
 
 @extend(module.RetInstruction)
@@ -425,10 +539,16 @@ class RetInstruction(object):
     if self.opval:
       value = self.opval.GetValue(context)
       context.ExitFunction()
-      context.SetValue(context.location.inst.value_idx, value)
+      call_inst = context.location.inst
+      context.SetValue(call_inst.type, call_inst.value_idx, value)
     else:
       context.ExitFunction()
     context.location.NextInstruction()
+
+  def GetValues(self):
+    if self.opval:
+      return [self.opval]
+    return []
 
 
 @extend(module.VSelectInstruction)
@@ -436,22 +556,27 @@ class VSelectInstruction(object):
   def Execute(self, context):
     value = self.cond.GetValue(context)
     if value:
-      context.SetValue(self.value_idx, self.trueval.GetValue(context))
+      context.SetValue(self.type, self.value_idx,
+                       self.trueval.GetValue(context))
     else:
-      context.SetValue(self.value_idx, self.falseval.GetValue(context))
+      context.SetValue(self.type, self.value_idx,
+                       self.falseval.GetValue(context))
     context.location.NextInstruction()
+
+  def GetValues(self):
+    return [self.cond, self.trueval, self.falseval]
 
 
 # Built-in functions (IRT) #
 
 @log_fn
 def nacl_irt_query(context, name_p, table_p, table_size):
-  name_mem, name_address = context.GetMemoryFromAddress(name_p)
-  name = memory.ReadCString(name_mem, name_address)
+  name_mem, name_p = context.GetMemoryFromAddress(name_p)
+  name = memory.ReadCString(name_mem, name_p)
 
-  print '>>> nacl_irt_query(%s)' % name
+  print '>>> nacl_irt_query(%r)' % name
 
-  table_mem, table_address = context.GetMemoryFromAddress(table_p)
+  table_mem, table_p = context.GetMemoryFromAddress(table_p)
 
   def BuiltinFunctionToId(fn):
     try:
@@ -461,7 +586,7 @@ def nacl_irt_query(context, name_p, table_p, table_size):
     return FN_HIGH_BIT | index
 
   def WriteTable(iface):
-    writer = memory.MemoryWriter(table_mem, table_address)
+    writer = memory.MemoryWriter(table_mem, table_p)
     count = min(table_size / 4, len(iface))
     for i in range(count):
       fn_id = BuiltinFunctionToId(iface[i])
@@ -471,7 +596,14 @@ def nacl_irt_query(context, name_p, table_p, table_size):
   iface = nacl_irt_query_map.get(name)
   if iface:
     return WriteTable(iface)
+  else:
+    raise NotImplementedError()
   return 0
+
+EBADF = 9
+EAGAIN = 11
+EINVAL = 22
+ENOSYS = 38
 
 # nacl-irt-basic-0.1 interface #
 @log_fn
@@ -480,62 +612,127 @@ def nacl_irt_basic_exit(context, status):
 
 @log_fn
 def nacl_irt_basic_gettod(context, timeval_p):
-  return 38  # ENOSYS
+  raise NotImplementedError()
+  return ENOSYS
 
 @log_fn
 def nacl_irt_basic_clock(context, ticks_p):
-  return 38  # ENOSYS
+  raise NotImplementedError()
+  return ENOSYS
 
 @log_fn
 def nacl_irt_basic_nanosleep(context, req_p, rem_p):
-  return 38  # ENOSYS
+  raise NotImplementedError()
+  return ENOSYS
 
 @log_fn
 def nacl_irt_basic_sched_yield(context):
-  return 38  # ENOSYS
+  raise NotImplementedError()
+  return ENOSYS
 
 @log_fn
-def nacl_irt_basic_sys_conf(context, name_p, value_p):
-  return 38  # ENOSYS
+def nacl_irt_basic_sysconf(context, name, value_p):
+  # TODO(binji): What are appropriate values for these?
+  mem, value_p = context.GetMemoryFromAddress(value_p)
+  if name == 0:  # _SC_SENDMSG_MAX_SIZE
+    mem.WriteU32(value_p, 4096)
+    return 0
+  elif name == 1:  #_SC_NPROCESSORS_ONLN
+    mem.WriteU32(value_p, 1)
+    return 0
+  elif name == 2:  # _SC_PAGESIZE
+    mem.WriteU32(value_p, 4096)
+    return 0
+  return EINVAL
 
 # nacl-irt-fdio-0.1 interface #
 @log_fn
 def nacl_irt_fdio_close(context, fd):
-  return 38  # ENOSYS
+  if fd not in (0, 1, 2):  # stdout, stderr
+    return EBADF
+  return 0
 
 @log_fn
 def nacl_irt_fdio_dup(context, fd, newfd_p):
-  return 38  # ENOSYS
+  raise NotImplementedError()
+  return ENOSYS
 
 @log_fn
 def nacl_irt_fdio_dup2(context, fd, newfd):
-  return 38  # ENOSYS
+  raise NotImplementedError()
+  return ENOSYS
 
 @log_fn
 def nacl_irt_fdio_read(context, fd, buf_p, count, nread_p):
-  return 38  # ENOSYS
+  raise NotImplementedError()
+  return ENOSYS
 
 @log_fn
 def nacl_irt_fdio_write(context, fd, buf_p, count, nwrote_p):
-  return 38  # ENOSYS
+  if fd not in (1, 2):  # stdout, stderr
+    return 9  # EBADF
+
+  mem, buf_p = context.GetMemoryFromAddress(buf_p)
+  data = memory.ReadCString(mem, buf_p)
+  print 'nacl_irt_fdio_write >> %r' % data
+  return 0
 
 @log_fn
 def nacl_irt_fdio_seek(context, fd, offset, whence, new_offset_p):
-  return 38  # ENOSYS
+  raise NotImplementedError()
+  return ENOSYS
 
 @log_fn
 def nacl_irt_fdio_fstat(context, fd, stat_p):
-  return 38  # ENOSYS
+  # offset size
+  # 0  8 dev_t     st_dev;
+  # 8  8 ino_t     st_ino;
+  # 16 4 mode_t    st_mode;
+  # 20 4 nlink_t   st_nlink;
+  # 24 4 uid_t     st_uid;
+  # 28 4 gid_t     st_gid;
+  # 32 8 dev_t     st_rdev;
+  # 40 8 off_t     st_size;
+  # 48 4 blksize_t st_blksize;
+  # 52 4 blkcnt_t  st_blocks;
+  # 56 8 time_t    st_atime;
+  # 64 8 int64_t   st_atimensec;
+  # 72 8 time_t    st_mtime;
+  # 80 8 int64_t   st_mtimensec;
+  # 88 8 time_t    st_ctime;
+  # 96 8 int64_t   st_ctimensec;
+  # 104 total
+  if fd != 1:
+    return EINVAL
+  mem, stat_p = context.GetMemoryFromAddress(stat_p)
+  mem.WriteU64(stat_p + 0, 11)      # st_dev
+  mem.WriteU64(stat_p + 8, 16)      # st_ino
+  mem.WriteU32(stat_p + 16, 20620)  # st_mode
+  mem.WriteU32(stat_p + 20, 1)      # st_nlink
+  mem.WriteU32(stat_p + 24, 1)      # st_uid
+  mem.WriteU32(stat_p + 28, 1)      # st_gid
+  mem.WriteU64(stat_p + 32, 34829)  # st_rdev
+  mem.WriteU64(stat_p + 40, 0)      # st_size
+  mem.WriteU32(stat_p + 48, 1024)   # st_blksize
+  mem.WriteU32(stat_p + 52, 0)      # st_blocks
+  mem.WriteU64(stat_p + 56, 0)      # st_atime
+  mem.WriteU64(stat_p + 64, 0)      # st_atimensec
+  mem.WriteU64(stat_p + 72, 0)      # st_mtime
+  mem.WriteU64(stat_p + 80, 0)      # st_mtimensec
+  mem.WriteU64(stat_p + 88, 0)      # st_ctime
+  mem.WriteU64(stat_p + 96, 0)      # st_ctimensec
+  return 0
 
 @log_fn
 def nacl_irt_fdio_getdents(context, fd, dirent_p, count, nread_p):
-  return 38  # ENOSYS
+  raise NotImplementedError()
+  return ENOSYS
 
 # nacl-irt-memory-0.3 interface #
 @log_fn
 def nacl_irt_memory_mmap(context, addr_pp, len_, prot, flags, fd, off):
   if (flags & 0x20) != 0x20:  # MAP_ANONYMOUS
-    return 22  # EINVAL
+    return EINVAL
 
   # TODO(binji): less-stupid mmap
   size = context.heap.memory.num_bytes
@@ -549,11 +746,13 @@ def nacl_irt_memory_mmap(context, addr_pp, len_, prot, flags, fd, off):
 
 @log_fn
 def nacl_irt_memory_munmap(context, addr, len_):
-  return 38  # ENOSYS
+  raise NotImplementedError()
+  return ENOSYS
 
 @log_fn
 def nacl_irt_memory_mprotect(context, addr, len_, prot):
-  return 38  # ENOSYS
+  raise NotImplementedError()
+  return ENOSYS
 
 # nacl-irt-tls-0.1 interface #
 @log_fn
@@ -565,13 +764,57 @@ def nacl_irt_tls_init(context, thread_ptr_p):
 def nacl_irt_tls_get(context):
   return context.tls_p
 
+@log_fn
+def nacl_irt_thread_thread_create(context, start_func_p, stack_p, thread_ptr_p):
+  raise NotImplementedError()
+  return ENOSYS
+
+@log_fn
+def nacl_irt_thread_thread_exit(context, stack_flag_p):
+  raise NotImplementedError()
+  return ENOSYS
+
+@log_fn
+def nacl_irt_thread_thread_nice(context, nice):
+  raise NotImplementedError()
+  return ENOSYS
+
+@log_fn
+def nacl_irt_futex_futex_wait_abs(context, addr_p, value, abstime_p):
+  raise NotImplementedError()
+  # (Doc From irt.h)
+  # If |*addr| still contains |value|, futex_wait_abs() waits to be
+  # woken up by a futex_wake(addr,...) call from another thread;
+  # otherwise, it immediately returns EAGAIN (which is the same as
+  # EWOULDBLOCK).  If woken by another thread, it returns 0.  If
+  # |abstime| is non-NULL and the time specified by |*abstime|
+  # passes, this returns ETIMEDOUT.
+  mem, addr_p = context.GetMemoryFromAddress(addr_p)
+  cur_value = mem.ReadU32(value)
+  if value == cur_value:
+    # Pretend we are woken up by another thread
+    return 0
+  else:
+    return EAGAIN
+
+@log_fn
+def nacl_irt_futex_futex_wake(context, addr_p, nwake, count_p):
+  # (Doc From irt.h)
+  # futex_wake() wakes up threads that are waiting on |addr| using
+  # futex_wait().  |nwake| is the maximum number of threads that will be
+  # woken up.  The number of threads that were woken is returned in
+  # |*count|.
+  mem, count_p = context.GetMemoryFromAddress(count_p)
+  mem.WriteU32(count_p, 0)
+  return 0
+
 nacl_irt_basic_0_1 = [
   nacl_irt_basic_exit,
   nacl_irt_basic_gettod,
   nacl_irt_basic_clock,
   nacl_irt_basic_nanosleep,
   nacl_irt_basic_sched_yield,
-  nacl_irt_basic_sys_conf,
+  nacl_irt_basic_sysconf,
 ]
 
 nacl_irt_fdio_0_1 = [
@@ -596,11 +839,24 @@ nacl_irt_tls_0_1 = [
   nacl_irt_tls_get,
 ]
 
+nacl_irt_thread_0_1 = [
+  nacl_irt_thread_thread_create,
+  nacl_irt_thread_thread_exit,
+  nacl_irt_thread_thread_nice,
+]
+
+nacl_irt_futex_0_1 = [
+  nacl_irt_futex_futex_wait_abs,
+  nacl_irt_futex_futex_wake,
+]
+
 nacl_irt_query_map = {
   'nacl-irt-basic-0.1': nacl_irt_basic_0_1,
   'nacl-irt-fdio-0.1': nacl_irt_fdio_0_1,
   'nacl-irt-memory-0.3': nacl_irt_memory_0_3,
   'nacl-irt-tls-0.1': nacl_irt_tls_0_1,
+  'nacl-irt-thread-0.1': nacl_irt_thread_0_1,
+  'nacl-irt-futex-0.1': nacl_irt_futex_0_1,
 }
 
 builtin_functions = [
@@ -615,20 +871,11 @@ AddInterface(nacl_irt_basic_0_1)
 AddInterface(nacl_irt_fdio_0_1)
 AddInterface(nacl_irt_memory_0_3)
 AddInterface(nacl_irt_tls_0_1)
+AddInterface(nacl_irt_thread_0_1)
+AddInterface(nacl_irt_futex_0_1)
 
 
 # Intrinsics #
-
-@log_fn
-def llvm_nacl_atomic_load_i32(context, addr_p, flags):
-  mem, addr_p = context.GetMemoryFromAddress(addr_p)
-  if addr_p == 0:
-    raise module.Error('Reading from NULL pointer')
-  return mem.Read(memory.U32, addr_p)
-
-@log_fn
-def llvm_nacl_read_tp(context):
-  return context.tls_p
 
 @log_fn
 def llvm_memcpy_p0i8_p0i8_i32(context, dst_p, src_p, len_, align, isvolatile):
@@ -636,17 +883,118 @@ def llvm_memcpy_p0i8_p0i8_i32(context, dst_p, src_p, len_, align, isvolatile):
   src_mem, src_p = context.GetMemoryFromAddress(src_p)
   # TODO(binji): optimize
   for off in range(len_):
-    value = dst_mem.ReadU8(dst_p + off)
-    src_mem.WriteU8(src_p + off, value)
+    value = src_mem.ReadU8(src_p + off)
+    dst_mem.WriteU8(dst_p + off, value)
 
+@log_fn
+def llvm_memmove_p0i8_p0i8_i32(context, dst_p, src_p, len_, align, isvolatile):
+  dst_mem, dst_p = context.GetMemoryFromAddress(dst_p)
+  src_mem, src_p = context.GetMemoryFromAddress(src_p)
+  # TODO(binji): optimize
+  if dst_mem == src_mem and dst_p > src_p:
+    # Copy backwards
+    for off in reversed(range(len_)):
+      value = src_mem.ReadU8(src_p + off)
+      dst_mem.WriteU8(dst_p + off, value)
+  else:
+    # Copy forwards
+    for off in range(len_):
+      value = src_mem.ReadU8(src_p + off)
+      dst_mem.WriteU8(dst_p + off, value)
+
+
+@log_fn
+def llvm_memset_p0i8_i32(context, dst_p, value, len_, align, isvolatile):
+  dst_mem, dst_p = context.GetMemoryFromAddress(dst_p)
+  for off in range(len_):
+    dst_mem.WriteU8(dst_p + off, value)
+
+@log_fn
+def llvm_nacl_atomic_load_i32(context, addr_p, flags):
+  mem, addr_p = context.GetMemoryFromAddress(addr_p)
+  return mem.ReadU32(addr_p)
+
+@log_fn
+def llvm_nacl_atomic_rmw_i32(context, op, addr_p, value, memory_order):
+  mem, addr_p = context.GetMemoryFromAddress(addr_p)
+  # Exchange is a special case; we don't write the same value we return.
+  if op == 6:  # Exchange
+    result = mem.ReadU32(addr_p)
+    mem.WriteU32(addr_p, value)
+    return result
+
+  if op == 1:  # Add
+    result = mem.ReadU32(addr_p) + value
+  elif op == 2:  # Sub
+    result = mem.ReadU32(addr_p) - value
+  elif op == 3:  # And
+    result = mem.ReadU32(addr_p) & value
+  elif op == 4:  # Or
+    result = mem.ReadU32(addr_p) | value
+  elif op == 5:  # Xor
+    result = mem.ReadU32(addr_p) ^ value
+  else:
+    raise module.Error('Invalid rmw op: %d' % op)
+
+  result = IntegerType(32).CastValue(result)
+  mem.WriteU32(addr_p, result)
+  return result
+
+@log_fn
+def llvm_nacl_atomic_store_i32(context, value, addr_p, flags):
+  mem, addr_p = context.GetMemoryFromAddress(addr_p)
+  return mem.WriteU32(addr_p, value)
+
+@log_fn
+def llvm_nacl_atomic_cmpxchg_i32(context, addr_p, expected, desired,
+                                 memory_order_success, memory_order_failure):
+  mem, addr_p = context.GetMemoryFromAddress(addr_p)
+  result = mem.ReadU32(addr_p)
+  if result == expected:
+    mem.WriteU32(addr_p, desired)
+  return result
+
+@log_fn
+def llvm_nacl_read_tp(context):
+  return context.tls_p
 
 intrinsics = {
-  'llvm.nacl.atomic.load.i32': llvm_nacl_atomic_load_i32,
-  'llvm.nacl.read.tp': llvm_nacl_read_tp,
   'llvm.memcpy.p0i8.p0i8.i32': llvm_memcpy_p0i8_p0i8_i32,
+  'llvm.memmove.p0i8.p0i8.i32': llvm_memmove_p0i8_p0i8_i32,
+  'llvm.memset.p0i8.i32': llvm_memset_p0i8_i32,
+  'llvm.nacl.atomic.load.i32': llvm_nacl_atomic_load_i32,
+  'llvm.nacl.atomic.rmw.i32': llvm_nacl_atomic_rmw_i32,
+  'llvm.nacl.atomic.store.i32': llvm_nacl_atomic_store_i32,
+  'llvm.nacl.atomic.cmpxchg.i32': llvm_nacl_atomic_cmpxchg_i32,
+  'llvm.nacl.read.tp': llvm_nacl_read_tp,
 }
 
 ###############################################################################
+
+class NullPointerError(Exception):
+  pass
+
+
+class CheckedMemory(memory.MemoryBuffer):
+  def __init__(self, name, num_bytes):
+    memory.MemoryBuffer.__init__(self, num_bytes)
+    self.name = name
+    self.constants_offset = None
+
+  def Read(self, typ, offset):
+    if offset == 0:
+      raise NullPointerError('Reading from NULL in %r' % self)
+    value = memory.MemoryBuffer.Read(self, typ, offset)
+    print '!!! Read %s %s => %s' % (self.name, offset, value)
+    return value
+
+  def Write(self, typ, offset, value):
+    if offset == 0:
+      raise NullPointerError('Writing to NULL in %r' % self)
+    if self.constants_offset and offset >= self.constants_offset:
+      raise module.Error('Writing to constant value in %r' % self)
+    print '!!! Write %s => %s %d' % (value, self.name, offset)
+    memory.MemoryBuffer.Write(self, typ, offset, value)
 
 
 class Location(object):
@@ -679,16 +1027,18 @@ class Location(object):
 
 class Stack(object):
   def __init__(self, stack_size):
-    self.memory = memory.Memory(stack_size)
+    self.memory = CheckedMemory('STACK', stack_size)
     self.frames = []
     self.top = 4  # Skip NULL address
 
   def EnterFunction(self, location, values):
+    print '+++ Entering function. new stack depth = %d' % len(self.frames)
     self.frames.append(CallFrame(location, values, self.top))
 
   def ExitFunction(self):
     frame = self.frames[-1]
     self.frames.pop()
+    print '--- Exiting function. new stack depth = %d' % len(self.frames)
     self.top = frame.top
     return frame.location, frame.values
 
@@ -696,6 +1046,9 @@ class Stack(object):
     self.top = memory.Align(self.top, alignment)
     result = self.top
     self.top += size
+    if self.top > self.memory.num_bytes:
+      self.memory.Resize(self.top)
+
     return ADDRESS_SOURCE_STACK | result
 
 
@@ -707,26 +1060,27 @@ class CallFrame(object):
 
 
 class GlobalMemory(object):
-  def __init__(self, mod):
-    self.memory = memory.Memory(mod.GetMemSize())
+  def __init__(self, mod, argv=None, envp=None):
+    self.memory = CheckedMemory('GLOBAL', mod.GetMemSize(argv, envp))
     writer = memory.MemoryWriter(self.memory)
-    mod.InitializeMemory(writer)
+    constants_offset, _ = mod.InitializeMemory(writer, argv, envp)
+    self.memory.constants_offset = constants_offset
 
 
 class Heap(object):
   def __init__(self, init_size):
-    self.memory = memory.Memory(init_size)
+    self.memory = CheckedMemory('HEAP', init_size)
 
   def Resize(self, new_size):
     self.memory.Resize(new_size)
 
 
 class Context(object):
-  def __init__(self, mod, stack_size):
+  def __init__(self, mod, stack_size, argv=None, envp=None):
     self.module = mod
     self.stack = Stack(stack_size)
     self.heap = Heap(4)  # Skip the NULL address
-    self.global_memory = GlobalMemory(mod)
+    self.global_memory = GlobalMemory(mod, argv, envp)
     self.location = Location()
     self.values = None
     self.EnterFunction(mod.GetFunctionByName('_start'))
@@ -742,13 +1096,13 @@ class Context(object):
   def ExitFunction(self):
     self.location, self.values = self.stack.ExitFunction()
 
-  def SetValue(self, idx, value):
+  def SetValue(self, typ, idx, value):
     offset = self.location.function.value_idx_offset
-    self.values[idx - offset] = value
+    self.values[idx - offset] = typ.CastValue(value)
 
-  def SetArgValue(self, idx, value):
+  def SetArgValue(self, typ, idx, value):
     assert 0 <= idx < len(self.location.function.type.argtypes)
-    self.values[idx] = value
+    self.values[idx] = typ.CastValue(value)
 
   def GetValue(self, idx):
     offset = self.location.function.value_idx_offset
@@ -768,21 +1122,38 @@ class Context(object):
     return mem, address & ADDRESS_POINTER_MASK
 
 
-def Run(mod, stack_size):
-  context = Context(mod, stack_size)
+def Run(mod, stack_size, argv=None, envp=None):
+  context = Context(mod, stack_size, argv, envp)
   # First arg is the address of the init structure. We always initialize it to
   # 4.
-  context.SetArgValue(0, 4)
+  context.SetArgValue(IntegerType(32), 0, 4)
   last_bb_idx = None
+  last_function = None
   while True:
+    if context.location.function != last_function:
+      print '* Function %s' % context.location.function
+      last_function = context.location.function
+
     if context.location.bb_idx != last_bb_idx:
-      print 'Block %s' % context.location.bb_idx
+      print '** Block %s' % context.location.bb_idx
       last_bb_idx = context.location.bb_idx
     inst = context.location.inst
-    print inst
+
+    print '  ', inst
+
+    for value in inst.GetValues():
+      try:
+        print '    %s = %s' % (value, value.GetValue(context))
+      except:
+        print '    %s = Invalid' % value
+
+    function_before = context.location.function
     inst.Execute(context)
-    if inst.HasValue():
-      print '  %%%s = %s' % (inst.value_idx, context.GetValue(inst.value_idx))
+    function_after = context.location.function
+    function_changed = function_before != function_after
+
+    if not function_changed and inst.HasValue():
+      print '    %%%s = %s' % (inst.value_idx, context.GetValue(inst.value_idx))
 
 
 def main(args):
@@ -792,7 +1163,7 @@ def main(args):
     parser.error('Expected file')
 
   m = module.Read(open(args[0]))
-  Run(m, 128)
+  Run(m, 128, args[1:])
 
 if __name__ == '__main__':
   sys.exit(main(sys.argv[1:]))
