@@ -15,10 +15,11 @@ include $(NACL_SDK_ROOT)/tools/common.mk
 LIBS = $(DEPS) ppapi pthread
 CFLAGS = -Wall
 
-TARGETS = fact simple hello_world
+TARGETS = fact simple hello_world hello_cpp
 fact_SOURCES = fact.c
 simple_SOURCES = simple.c
 hello_world_SOURCES = hello_world.c
+hello_cpp_SOURCES = hello_cpp.cc
 
 .PHONY: all
 all: $(addsuffix .pexe,$(TARGETS))

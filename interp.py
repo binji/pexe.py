@@ -21,6 +21,8 @@ ADDRESS_POINTER_MASK  = 0x3fffffff
 FN_HIGH_BIT = 0x80000000
 FN_NACL_IRT_QUERY = FN_HIGH_BIT + 0
 
+options = None
+
 # Hack some classes :)
 def extend(cls):
   def decorator(newcls):
@@ -34,15 +36,18 @@ def extend(cls):
     return cls
   return decorator
 
-def log_fn(fn):
-  def decorator(*args):
-    try:
-      arg_kv = ', '.join('%s=%r' % (fn.__code__.co_varnames[i], args[i])
-                         for i in range(len(args)))
-    except IndexError:
-      arg_kv = '???'
-    print '>>> %s(%s)' % (fn.__name__, arg_kv)
-    return fn(*args)
+def log_fn(trace_field=None):
+  def decorator(fn):
+    def new_fn(*args):
+      try:
+        arg_kv = ', '.join('%s=%r' % (fn.__code__.co_varnames[i], args[i])
+                           for i in range(len(args)))
+      except IndexError:
+        arg_kv = '???'
+      if not trace_field or getattr(options, trace_field):
+        print '>>> %s(%s)' % (fn.__name__, arg_kv)
+      return fn(*args)
+    return new_fn
   return decorator
 
 @extend(module.ModuleBlock)
@@ -150,7 +155,7 @@ class ModuleBlock(object):
   def _WriteAll(self, generator, writer, fixups):
     for var in generator:
       writer.Align(var.alignment)
-      if writer.offset:
+      if options.trace_globals and writer.offset:
         print '%%%d: %s' % (writer.offset, var)
       var.Write(writer, fixups)
 
@@ -208,6 +213,12 @@ class RelocInitializer(object):
 
 @extend(module.IntegerConstantValue)
 class IntegerConstantValue(object):
+  def GetValue(self, context):
+    return self.type.CastValue(self.value)
+
+
+@extend(module.FloatConstantValue)
+class FloatConstantValue(object):
   def GetValue(self, context):
     return self.type.CastValue(self.value)
 
@@ -348,14 +359,29 @@ class BinOpInstruction(object):
       value = opval0 - opval1
     elif self.opcode == module.BINOP_MUL:
       value = opval0 * opval1
-    elif self.opcode == module.BINOP_OR:
-      value = opval0 | opval1
-    elif self.opcode == module.BINOP_AND:
-      value = opval0 & opval1
-    elif self.opcode == module.BINOP_XOR:
-      value = opval0 ^ opval1
+    elif self.opcode == module.BINOP_UDIV:
+      value = opval0 / opval1
+    elif self.opcode == module.BINOP_SDIV:
+      opval0 = self.opval0.type.CastValue(opval0, signed=True)
+      value = opval0 / opval1
+    elif self.opcode == module.BINOP_UDIV:
+      value = opval0 % opval1
+    elif self.opcode == module.BINOP_SREM:
+      opval0 = self.opval0.type.CastValue(opval0, signed=True)
+      value = opval0 % opval1
     elif self.opcode == module.BINOP_SHL:
       value = opval0 << opval1
+    elif self.opcode == module.BINOP_LSHR:
+      value = opval0 >> opval1
+    elif self.opcode == module.BINOP_ASHR:
+      opval0 = self.opval0.type.CastValue(opval0, signed=True)
+      value = opval0 >> opval1
+    elif self.opcode == module.BINOP_AND:
+      value = opval0 & opval1
+    elif self.opcode == module.BINOP_OR:
+      value = opval0 | opval1
+    elif self.opcode == module.BINOP_XOR:
+      value = opval0 ^ opval1
     else:
       raise module.Error('Unimplemented binop: %s' % self.opcode)
     context.SetValue(self.type, self.value_idx, value)
@@ -502,8 +528,9 @@ class CallInstruction(object):
         return
 
       if function_idx >= len(context.module.functions):
-        print 'Attempting to call non-existent function %d. (only %d)' % (
-            function_idx, len(context.module.functions))
+        raise module.Error(
+            'Attempting to call non-existent function %d. (only %d)' % (
+                function_idx, len(context.module.functions)))
       function = context.module.functions[function_idx]
     else:
       function = self.callee.function
@@ -569,12 +596,13 @@ class VSelectInstruction(object):
 
 # Built-in functions (IRT) #
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_query(context, name_p, table_p, table_size):
   name_mem, name_p = context.GetMemoryFromAddress(name_p)
   name = memory.ReadCString(name_mem, name_p)
 
-  print '>>> nacl_irt_query(%r)' % name
+  if options.trace_irt:
+    print '>>> nacl_irt_query(%r)' % name
 
   table_mem, table_p = context.GetMemoryFromAddress(table_p)
 
@@ -606,31 +634,31 @@ EINVAL = 22
 ENOSYS = 38
 
 # nacl-irt-basic-0.1 interface #
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_basic_exit(context, status):
   sys.exit(status)
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_basic_gettod(context, timeval_p):
   raise NotImplementedError()
   return ENOSYS
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_basic_clock(context, ticks_p):
   raise NotImplementedError()
   return ENOSYS
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_basic_nanosleep(context, req_p, rem_p):
   raise NotImplementedError()
   return ENOSYS
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_basic_sched_yield(context):
   raise NotImplementedError()
   return ENOSYS
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_basic_sysconf(context, name, value_p):
   # TODO(binji): What are appropriate values for these?
   mem, value_p = context.GetMemoryFromAddress(value_p)
@@ -646,28 +674,28 @@ def nacl_irt_basic_sysconf(context, name, value_p):
   return EINVAL
 
 # nacl-irt-fdio-0.1 interface #
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_fdio_close(context, fd):
   if fd not in (0, 1, 2):  # stdout, stderr
     return EBADF
   return 0
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_fdio_dup(context, fd, newfd_p):
   raise NotImplementedError()
   return ENOSYS
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_fdio_dup2(context, fd, newfd):
   raise NotImplementedError()
   return ENOSYS
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_fdio_read(context, fd, buf_p, count, nread_p):
   raise NotImplementedError()
   return ENOSYS
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_fdio_write(context, fd, buf_p, count, nwrote_p):
   if fd not in (1, 2):  # stdout, stderr
     return 9  # EBADF
@@ -677,12 +705,12 @@ def nacl_irt_fdio_write(context, fd, buf_p, count, nwrote_p):
   print 'nacl_irt_fdio_write >> %r' % data
   return 0
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_fdio_seek(context, fd, offset, whence, new_offset_p):
   raise NotImplementedError()
   return ENOSYS
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_fdio_fstat(context, fd, stat_p):
   # offset size
   # 0  8 dev_t     st_dev;
@@ -723,13 +751,13 @@ def nacl_irt_fdio_fstat(context, fd, stat_p):
   mem.WriteU64(stat_p + 96, 0)      # st_ctimensec
   return 0
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_fdio_getdents(context, fd, dirent_p, count, nread_p):
   raise NotImplementedError()
   return ENOSYS
 
 # nacl-irt-memory-0.3 interface #
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_memory_mmap(context, addr_pp, len_, prot, flags, fd, off):
   if (flags & 0x20) != 0x20:  # MAP_ANONYMOUS
     return EINVAL
@@ -744,42 +772,42 @@ def nacl_irt_memory_mmap(context, addr_pp, len_, prot, flags, fd, off):
   mem.WriteU32(addr_pp, address)
   return 0
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_memory_munmap(context, addr, len_):
   raise NotImplementedError()
   return ENOSYS
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_memory_mprotect(context, addr, len_, prot):
   raise NotImplementedError()
   return ENOSYS
 
 # nacl-irt-tls-0.1 interface #
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_tls_init(context, thread_ptr_p):
   context.tls_p = thread_ptr_p
   return 0
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_tls_get(context):
   return context.tls_p
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_thread_thread_create(context, start_func_p, stack_p, thread_ptr_p):
   raise NotImplementedError()
   return ENOSYS
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_thread_thread_exit(context, stack_flag_p):
   raise NotImplementedError()
   return ENOSYS
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_thread_thread_nice(context, nice):
   raise NotImplementedError()
   return ENOSYS
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_futex_futex_wait_abs(context, addr_p, value, abstime_p):
   raise NotImplementedError()
   # (Doc From irt.h)
@@ -797,7 +825,7 @@ def nacl_irt_futex_futex_wait_abs(context, addr_p, value, abstime_p):
   else:
     return EAGAIN
 
-@log_fn
+@log_fn('trace_irt')
 def nacl_irt_futex_futex_wake(context, addr_p, nwake, count_p):
   # (Doc From irt.h)
   # futex_wake() wakes up threads that are waiting on |addr| using
@@ -877,7 +905,7 @@ AddInterface(nacl_irt_futex_0_1)
 
 # Intrinsics #
 
-@log_fn
+@log_fn('trace_intrinsics')
 def llvm_memcpy_p0i8_p0i8_i32(context, dst_p, src_p, len_, align, isvolatile):
   dst_mem, dst_p = context.GetMemoryFromAddress(dst_p)
   src_mem, src_p = context.GetMemoryFromAddress(src_p)
@@ -886,7 +914,7 @@ def llvm_memcpy_p0i8_p0i8_i32(context, dst_p, src_p, len_, align, isvolatile):
     value = src_mem.ReadU8(src_p + off)
     dst_mem.WriteU8(dst_p + off, value)
 
-@log_fn
+@log_fn('trace_intrinsics')
 def llvm_memmove_p0i8_p0i8_i32(context, dst_p, src_p, len_, align, isvolatile):
   dst_mem, dst_p = context.GetMemoryFromAddress(dst_p)
   src_mem, src_p = context.GetMemoryFromAddress(src_p)
@@ -903,49 +931,52 @@ def llvm_memmove_p0i8_p0i8_i32(context, dst_p, src_p, len_, align, isvolatile):
       dst_mem.WriteU8(dst_p + off, value)
 
 
-@log_fn
+@log_fn('trace_intrinsics')
 def llvm_memset_p0i8_i32(context, dst_p, value, len_, align, isvolatile):
   dst_mem, dst_p = context.GetMemoryFromAddress(dst_p)
   for off in range(len_):
     dst_mem.WriteU8(dst_p + off, value)
 
-@log_fn
+@log_fn('trace_intrinsics')
+def llvm_nacl_atomic_load_i8(context, addr_p, flags):
+  mem, addr_p = context.GetMemoryFromAddress(addr_p)
+  return mem.ReadU8(addr_p)
+
+@log_fn('trace_intrinsics')
 def llvm_nacl_atomic_load_i32(context, addr_p, flags):
   mem, addr_p = context.GetMemoryFromAddress(addr_p)
   return mem.ReadU32(addr_p)
 
-@log_fn
+@log_fn('trace_intrinsics')
 def llvm_nacl_atomic_rmw_i32(context, op, addr_p, value, memory_order):
   mem, addr_p = context.GetMemoryFromAddress(addr_p)
-  # Exchange is a special case; we don't write the same value we return.
-  if op == 6:  # Exchange
-    result = mem.ReadU32(addr_p)
-    mem.WriteU32(addr_p, value)
-    return result
 
+  old_value = mem.ReadU32(addr_p)
   if op == 1:  # Add
-    result = mem.ReadU32(addr_p) + value
+    new_value = old_value + value
   elif op == 2:  # Sub
-    result = mem.ReadU32(addr_p) - value
+    new_value = old_value - value
   elif op == 3:  # And
-    result = mem.ReadU32(addr_p) & value
+    new_value = old_value & value
   elif op == 4:  # Or
-    result = mem.ReadU32(addr_p) | value
+    new_value = old_value | value
   elif op == 5:  # Xor
-    result = mem.ReadU32(addr_p) ^ value
+    new_value = old_value ^ value
+  elif op == 6:  # Exchange
+    new_value = value
   else:
     raise module.Error('Invalid rmw op: %d' % op)
 
-  result = IntegerType(32).CastValue(result)
-  mem.WriteU32(addr_p, result)
-  return result
+  new_value = IntegerType(32).CastValue(new_value)
+  mem.WriteU32(addr_p, new_value)
+  return old_value
 
-@log_fn
+@log_fn('trace_intrinsics')
 def llvm_nacl_atomic_store_i32(context, value, addr_p, flags):
   mem, addr_p = context.GetMemoryFromAddress(addr_p)
   return mem.WriteU32(addr_p, value)
 
-@log_fn
+@log_fn('trace_intrinsics')
 def llvm_nacl_atomic_cmpxchg_i32(context, addr_p, expected, desired,
                                  memory_order_success, memory_order_failure):
   mem, addr_p = context.GetMemoryFromAddress(addr_p)
@@ -954,7 +985,7 @@ def llvm_nacl_atomic_cmpxchg_i32(context, addr_p, expected, desired,
     mem.WriteU32(addr_p, desired)
   return result
 
-@log_fn
+@log_fn('trace_intrinsics')
 def llvm_nacl_read_tp(context):
   return context.tls_p
 
@@ -962,6 +993,7 @@ intrinsics = {
   'llvm.memcpy.p0i8.p0i8.i32': llvm_memcpy_p0i8_p0i8_i32,
   'llvm.memmove.p0i8.p0i8.i32': llvm_memmove_p0i8_p0i8_i32,
   'llvm.memset.p0i8.i32': llvm_memset_p0i8_i32,
+  'llvm.nacl.atomic.load.i8': llvm_nacl_atomic_load_i8,
   'llvm.nacl.atomic.load.i32': llvm_nacl_atomic_load_i32,
   'llvm.nacl.atomic.rmw.i32': llvm_nacl_atomic_rmw_i32,
   'llvm.nacl.atomic.store.i32': llvm_nacl_atomic_store_i32,
@@ -985,7 +1017,8 @@ class CheckedMemory(memory.MemoryBuffer):
     if offset == 0:
       raise NullPointerError('Reading from NULL in %r' % self)
     value = memory.MemoryBuffer.Read(self, typ, offset)
-    print '!!! Read %s %s => %s' % (self.name, offset, value)
+    if options.trace_memory:
+      print '!!! Read %s %s => %s' % (self.name, offset, value)
     return value
 
   def Write(self, typ, offset, value):
@@ -993,7 +1026,8 @@ class CheckedMemory(memory.MemoryBuffer):
       raise NullPointerError('Writing to NULL in %r' % self)
     if self.constants_offset and offset >= self.constants_offset:
       raise module.Error('Writing to constant value in %r' % self)
-    print '!!! Write %s => %s %d' % (value, self.name, offset)
+    if options.trace_memory:
+      print '!!! Write %s => %s %d' % (value, self.name, offset)
     memory.MemoryBuffer.Write(self, typ, offset, value)
 
 
@@ -1032,13 +1066,11 @@ class Stack(object):
     self.top = 4  # Skip NULL address
 
   def EnterFunction(self, location, values):
-    print '+++ Entering function. new stack depth = %d' % len(self.frames)
     self.frames.append(CallFrame(location, values, self.top))
 
   def ExitFunction(self):
     frame = self.frames[-1]
     self.frames.pop()
-    print '--- Exiting function. new stack depth = %d' % len(self.frames)
     self.top = frame.top
     return frame.location, frame.values
 
@@ -1121,6 +1153,9 @@ class Context(object):
       raise module.Error('Invalid address source %x' % address_source)
     return mem, address & ADDRESS_POINTER_MASK
 
+  def __repr__(self):
+    return '<Context>'
+
 
 def Run(mod, stack_size, argv=None, envp=None):
   context = Context(mod, stack_size, argv, envp)
@@ -1130,40 +1165,58 @@ def Run(mod, stack_size, argv=None, envp=None):
   last_bb_idx = None
   last_function = None
   while True:
-    if context.location.function != last_function:
-      print '* Function %s' % context.location.function
-      last_function = context.location.function
+    if options.trace:
+      if context.location.function != last_function:
+        print '* Function %s' % context.location.function
+        last_function = context.location.function
 
-    if context.location.bb_idx != last_bb_idx:
-      print '** Block %s' % context.location.bb_idx
-      last_bb_idx = context.location.bb_idx
+      if context.location.bb_idx != last_bb_idx:
+        print '** Block %s' % context.location.bb_idx
+        last_bb_idx = context.location.bb_idx
+
     inst = context.location.inst
 
-    print '  ', inst
+    if options.trace:
+      print '  ', inst
 
-    for value in inst.GetValues():
-      try:
-        print '    %s = %s' % (value, value.GetValue(context))
-      except:
-        print '    %s = Invalid' % value
+      for value in inst.GetValues():
+        try:
+          print '    %s = %s' % (value, value.GetValue(context))
+        except:
+          print '    %s = Invalid' % value
 
-    function_before = context.location.function
+      function_before = context.location.function
+
     inst.Execute(context)
-    function_after = context.location.function
-    function_changed = function_before != function_after
 
-    if not function_changed and inst.HasValue():
-      print '    %%%s = %s' % (inst.value_idx, context.GetValue(inst.value_idx))
+    if options.trace:
+      function_after = context.location.function
+      function_changed = function_before != function_after
+
+      if not function_changed and inst.HasValue():
+        print '    %%%s = %s' % (
+            inst.value_idx, context.GetValue(inst.value_idx))
 
 
 def main(args):
+  global options
   parser = optparse.OptionParser()
+  parser.add_option('--trace', action='store_true', help='Trace execution')
+  parser.add_option('--trace-intrinsics', action='store_true',
+                    help='Trace instrinsic function calls')
+  parser.add_option('--trace-irt', action='store_true',
+                    help='Trace IRT function calls')
+  parser.add_option('--trace-globals', action='store_true',
+                    help='Trace global vars')
+  parser.add_option('--trace-memory', action='store_true',
+                    help='Trace memory access')
   options, args = parser.parse_args()
   if not args:
     parser.error('Expected file')
 
   m = module.Read(open(args[0]))
-  Run(m, 128, args[1:])
+  init_stack_size = 128
+  Run(m, init_stack_size, args[1:])
 
 if __name__ == '__main__':
   sys.exit(main(sys.argv[1:]))
