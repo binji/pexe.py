@@ -1175,15 +1175,7 @@ def ParseBitCode(bitcode):
   return ModuleBlock(module_block, context)
 
 
-def main(args):
-  parser = optparse.OptionParser()
-  options, args = parser.parse_args()
-  if not args:
-    parser.error('Expected file')
-
-  bc = bitcode.Read(open(args[0]))
-  module = ParseBitCode(bc)
-
+def _PrintModule(module):
   for var in module.global_vars:
     print 'Global %s' % var
   print
@@ -1196,6 +1188,17 @@ def main(args):
       for inst in bb.instructions:
         print '   ', inst
     print
+
+
+def main(args):
+  parser = optparse.OptionParser()
+  options, args = parser.parse_args()
+  if not args:
+    parser.error('Expected file')
+
+  module = Read(open(args[0]))
+  _PrintModule(module)
+
 
 
 if __name__ == '__main__':

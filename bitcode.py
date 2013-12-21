@@ -4,6 +4,7 @@
 # found in the LICENSE file.
 
 import optparse
+import struct
 import sys
 
 ENTRY_END_BLOCK = 0
@@ -31,50 +32,54 @@ class Error(Exception):
 class BitStream(object):
   def __init__(self, data):
     self.data = data
-    self.byte_offset = 0
-    self.bit_offset = 0  # [0..7]
+    self.datalen = len(self.data)
+    self.curword = 0
+    self.curword_bits = 0
+    self.bit_offset = 0
 
-  def ReadFracBits(self, num_bits):
-    assert num_bits <= 8 - self.bit_offset
+    # Pad data out to 32-bits, with an additional 32-bits (so we don't have
+    # to worry about calling struct.unpack_from at the end).
+    padding = 4 + ((4 - self.datalen & 3) & 3)
+    self.data += '\0' * padding
 
-    mask = (1 << num_bits) - 1
-    result = (self.data[self.byte_offset] >> self.bit_offset) & mask
+  def _ReadFracBits(self, num_bits):
+    assert num_bits <= self.curword_bits
+
+    result = self.curword & ((1 << num_bits) - 1)
+    self.curword >>= num_bits
+    self.curword_bits -= num_bits
     self.bit_offset += num_bits
-    if self.bit_offset == 8:
-      self.byte_offset += 1
-      self.bit_offset = 0
     return result
 
-  def Read(self, num_bits):
-    if 8 - self.bit_offset >= num_bits:
-      return self.ReadFracBits(num_bits)
+  def _FillCurWord(self):
+    byte_offset = self.bit_offset >> 3
+    self.curword = struct.unpack_from('<L', self.data, byte_offset)[0]
+    if byte_offset + 4 < self.datalen:
+      self.curword_bits = 32
     else:
-      # Need to advance byte_offset. First align to 8-bit boundary.
-      bits_left_in_byte = 8 - self.bit_offset
-      result = self.ReadFracBits(bits_left_in_byte)
-      num_bits -= bits_left_in_byte
+      self.curword_bits = (self.datalen - byte_offset) * 8
+    assert self.curword_bits <= 32
 
-      if num_bits > 0:
-        # Now read as many full bytes as requested
-        shift = bits_left_in_byte
-        while num_bits >= 8:
-          result += self.data[self.byte_offset] << shift
-          shift += 8
-          self.byte_offset += 1
-          num_bits -= 8
+  def Read(self, num_bits):
+    assert num_bits <= 32
+    if num_bits <= self.curword_bits:
+      return self._ReadFracBits(num_bits)
 
-        # Read the final remaining fractional bits
-        if num_bits > 0:
-          result += self.ReadFracBits(num_bits) << shift
-      return result
+    result = self.curword
+    bits_read = self.curword_bits
+    bits_left = num_bits - self.curword_bits
+    self.bit_offset += bits_read
+    self._FillCurWord()
+    result |= self._ReadFracBits(bits_left) << bits_read
+    return result
 
   def ReadVbr(self, num_bits):
     piece = self.Read(num_bits)
     hi_mask = 1 << (num_bits - 1)
-    lo_mask = hi_mask - 1
     if (piece & hi_mask) == 0:
       return piece
 
+    lo_mask = hi_mask - 1
     result = 0
     shift = 0
     while True:
@@ -91,17 +96,29 @@ class BitStream(object):
     return result
 
   def TellBit(self):
-    return self.byte_offset * 8 + self.bit_offset
+    return self.bit_offset
 
   def SeekBit(self, offset):
-    self.byte_offset = offset / 8
-    self.bit_offset = offset & 7
+    # Align to 32-bits
+    self.bit_offset = offset & ~31
+    self._FillCurWord()
+
+    # Offset is not aligned, read the unaligned bits.
+    offset &= 31
+    if offset:
+      self._ReadFracBits(offset)
 
   def Align32(self):
     self.SeekBit((self.TellBit() + 31) & ~31)
 
   def AtEnd(self):
-    return self.byte_offset == len(self.data)
+    byte_offset = self.bit_offset >> 3
+    return byte_offset == self.datalen
+
+  def __repr__(self):
+    return ('<BitStream bit_offset=%d curword=0x%0x '
+             'curword_bits=%d datalen=%d>' % (
+        self.bit_offset, self.curword, self.curword_bits, self.datalen))
 
 
 class HeaderField(object):
@@ -382,21 +399,13 @@ def Read(f):
 
 
 def ReadString(s):
-  data = [ord(x) for x in s]
-  bs = BitStream(data)
+  bs = BitStream(s)
   bc = BitCode()
   bc.Read(bs)
   return bc
 
 
-def main(args):
-  parser = optparse.OptionParser()
-  options, args = parser.parse_args()
-  if not args:
-    parser.error('Expected file')
-
-  bc = Read(open(args[0]))
-
+def _PrintBitcode(bc):
   import json
   class Encoder(json.JSONEncoder):
     def default(self, o):
@@ -406,6 +415,16 @@ def main(args):
         d.update(_type=o.__class__.__name__)
       return d
   print json.dumps(bc, cls=Encoder, indent=2, sort_keys=True)
+
+
+def main(args):
+  parser = optparse.OptionParser()
+  options, args = parser.parse_args()
+  if not args:
+    parser.error('Expected file')
+
+  bc = Read(open(args[0]))
+  #_PrintBitcode(bc)
 
 
 if __name__ == '__main__':
