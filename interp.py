@@ -237,6 +237,12 @@ class FunctionArgValue(object):
     return self.type.CastValue(value)
 
 
+@extend(module.UndefConstantValue)
+class UndefConstantValue(object):
+  def GetValue(self, context):
+    return self.type.CastValue(0)
+
+
 @extend(module.GlobalVarValue)
 class GlobalVarValue(object):
   def GetValue(self, context):
@@ -452,6 +458,18 @@ class CastInstruction(object):
       value = opval
     elif self.opcode == module.CAST_SEXT:
       value = self.opval.type.CastValue(opval, signed=True)
+    elif self.opcode == module.CAST_FPTOSI:
+      value = self.opval.type.CastValue(opval, signed=True)
+    elif self.opcode in (module.CAST_FPTOUI, module.CAST_UITOFP,
+                         module.CAST_SITOFP, module.CAST_FPTRUNC,
+                         module.CAST_FPEXT):
+      value = self.opval.type.CastValue(opval)
+    elif self.opcode == module.CAST_BITCAST:
+      mem = memory.MemoryBuffer(8)
+      old_typ = ModuleTypeToMemoryType(self.opval.type)
+      new_typ = ModuleTypeToMemoryType(self.type)
+      mem.Write(old_typ, 0, opval)
+      value = mem.Read(new_typ, 0)
     else:
       raise module.Error('Unimplemented cast: %s' % self.opcode)
     context.SetValue(self.type, self.value_idx, value)
@@ -498,6 +516,32 @@ class Cmp2Instruction(object):
         value = 1 if opval0 < opval1 else 0
       elif self.predicate == module.ICMP_SLE:
         value = 1 if opval0 <= opval1 else 0
+    elif module.FCMP_FALSE <= self.predicate <= module.FCMP_TRUE:
+      opval0 = self.opval0.GetValue(context)
+      opval1 = self.opval1.GetValue(context)
+      # TODO(binji): handle unordered vs. ordered.
+      if self.predicate == module.FCMP_FALSE:
+        value = 0
+      elif self.predicate in (module.FCMP_OEQ, module.FCMP_UEQ):
+        value = 1 if opval0 == opval1 else 0
+      elif self.predicate in (module.FCMP_OGT, module.FCMP_UGT):
+        value = 1 if opval0 > opval1 else 0
+      elif self.predicate in (module.FCMP_OGE, module.FCMP_UGE):
+        value = 1 if opval0 >= opval1 else 0
+      elif self.predicate in (module.FCMP_OLT, module.FCMP_ULT):
+        value = 1 if opval0 < opval1 else 0
+      elif self.predicate in (module.FCMP_OLE, module.FCMP_ULE):
+        value = 1 if opval0 <= opval1 else 0
+      elif self.predicate in (module.FCMP_ONE, module.FCMP_UNE):
+        value = 1 if opval0 != opval1 else 0
+      elif self.predicate == module.FCMP_ORD:
+        # TODO(binji): implement
+        value = 1
+      elif self.predicate == module.FCMP_UNO:
+        # TODO(binji): implement
+        value = 1
+      elif self.predicate == module.FCMP_TRUE:
+        value = 1
 
     if value is None:
       raise module.Error('Unimplemented cmp2: %s' % self.predicate)
